@@ -18,396 +18,425 @@ jobs:
       GCC_TAG: android-12.1.0_r27
 
     steps:
-    - name: Checkout workflow repository
-      uses: actions/checkout@v4
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
 
-    - name: Set swap to 10G
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 10
+      - name: Set swap to 10G
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
 
-    - name: Setup build kernel environment
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Setup build kernel environment
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        echo "BUILD_TIME=$(TZ=Asia/Kolkata date '+%y%m%d')" >> "$GITHUB_ENV"
-        echo "BUILD_TIME_1=$(TZ=Asia/Kolkata date '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "BUILD_TIME=$(TZ=Asia/Kolkata date '+%y%m%d')" >> "$GITHUB_ENV"
+          echo "BUILD_TIME_1=$(TZ=Asia/Kolkata date '+%Y-%m-%d')" >> "$GITHUB_ENV"
 
-        sudo apt-get update
+          sudo apt-get update
 
-        sudo apt-get install -y \
-          git ccache automake flex lzop bison gperf build-essential \
-          zip curl wget zlib1g-dev g++-multilib bzip2 libbz2-dev \
-          liblz4-tool make squashfs-tools dpkg-dev libssl-dev \
-          python3 bc libc6-dev-i386 libncurses5-dev jq
+          sudo apt-get install -y \
+            git ccache automake flex lzop bison gperf build-essential \
+            zip curl wget zlib1g-dev g++-multilib bzip2 libbz2-dev \
+            liblz4-tool make squashfs-tools dpkg-dev libssl-dev \
+            python3 bc libc6-dev-i386 libncurses5-dev jq
 
-        mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
-    - name: Cache Clang toolchain
-      id: cache-clang
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-        key: ${{ env.CLANG_VERSION }}
+      - name: Cache Clang toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/clang-aosp
+          key: ${{ env.CLANG_VERSION }}
 
-    - name: Download and extract Clang
-      if: steps.cache-clang.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Download and extract Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace"
-        mkdir -p clang-aosp
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p clang-aosp
 
-        wget -O "${CLANG_VERSION}.tar.gz" \
-          "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          wget -O "${CLANG_VERSION}.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
 
-        tar -C clang-aosp -xzf "${CLANG_VERSION}.tar.gz"
+          tar -C clang-aosp -xzf "${CLANG_VERSION}.tar.gz"
 
-    - name: Cache GCC toolchain
-      id: cache-gcc
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.workspace }}/kernel_workspace/gcc-64
-        key: gcc-aarch64-${{ env.GCC_TAG }}
+      - name: Cache GCC toolchain
+        id: cache-gcc
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/gcc-64
+          key: gcc-aarch64-${{ env.GCC_TAG }}
 
-    - name: Download and extract GCC
-      if: steps.cache-gcc.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Download and extract GCC
+        if: steps.cache-gcc.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace"
-        mkdir -p gcc-64
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p gcc-64
 
-        wget -O gcc-aarch64.tar.gz \
-          "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
+          wget -O gcc-aarch64.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
 
-        tar -C gcc-64 -xzf gcc-aarch64.tar.gz
+          tar -C gcc-64 -xzf gcc-aarch64.tar.gz
 
-    - name: Download LineageOS 24 kernel source
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Download LineageOS 24 kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace"
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
 
-        git clone \
-          --recursive \
-          --depth=1 \
-          --branch lineage-24.0 \
-          https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
-          android-kernel
+          git clone \
+            --recursive \
+            --depth=1 \
+            --branch lineage-24.0 \
+            https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
+            android-kernel
 
-        cd android-kernel
+          cd android-kernel
 
-        echo "Kernel source branch:"
-        git branch --show-current
+          echo "Kernel source branch:"
+          git branch --show-current
 
-        echo "Kernel source commit:"
-        git rev-parse HEAD
+          echo "Kernel source commit:"
+          git rev-parse HEAD
 
-        test -f fs/namespace.c
-        test -f arch/arm64/configs/vendor/kona-perf_defconfig
-        test -f arch/arm64/configs/vendor/debugfs.config
+          test -f fs/namespace.c
+          test -f arch/arm64/configs/vendor/kona-perf_defconfig
+          test -f arch/arm64/configs/vendor/debugfs.config
 
-    - name: Apply path_umount compatibility patch
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Apply path_umount compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        cd "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
 
-        python3 - <<'PY'
-        from pathlib import Path
+          python3 - <<'PY'
+          from pathlib import Path
 
-        source = Path(
-            "kernel_workspace/android-kernel/fs/namespace.c"
-        )
-        patch = Path("patches/path_umount.c")
+          source = Path(
+              "kernel_workspace/android-kernel/fs/namespace.c"
+          )
+          patch = Path("patches/path_umount.c")
 
-        if not source.is_file():
-            raise SystemExit(f"Kernel source not found: {source}")
+          if not source.is_file():
+              raise SystemExit(f"Kernel source not found: {source}")
 
-        if not patch.is_file():
-            raise SystemExit(f"Patch file not found: {patch}")
+          if not patch.is_file():
+              raise SystemExit(f"Patch file not found: {patch}")
 
-        text = source.read_text()
-        code = patch.read_text().strip()
+          text = source.read_text()
+          code = patch.read_text().strip()
 
-        function_signature = "int path_umount(struct path *path, int flags)"
-        marker = "SYSCALL_DEFINE2(umount,"
+          function_signature = "int path_umount(struct path *path, int flags)"
+          marker = "SYSCALL_DEFINE2(umount,"
 
-        if function_signature in text:
-            raise SystemExit(
-                "path_umount() already exists; refusing duplicate insertion"
-            )
+          if function_signature in text:
+              raise SystemExit(
+                  "path_umount() already exists; refusing duplicate insertion"
+              )
 
-        if text.count(marker) != 1:
-            raise SystemExit(
-                "Could not uniquely locate the umount syscall definition"
-            )
+          if text.count(marker) != 1:
+              raise SystemExit(
+                  "Could not uniquely locate the umount syscall definition"
+              )
 
-        if not code:
-            raise SystemExit("path_umount.c is empty")
+          if not code:
+              raise SystemExit("path_umount.c is empty")
 
-        if "int path_umount(struct path *path, int flags)" not in code:
-            raise SystemExit(
-                "The patch does not contain the expected path_umount() function"
-            )
+          if function_signature not in code:
+              raise SystemExit(
+                  "The patch does not contain the expected path_umount() function"
+              )
 
-        # Insert at file scope, immediately before the umount syscall.
-        text = text.replace(marker, code + "\n\n" + marker, 1)
+          text = text.replace(marker, code + "\n\n" + marker, 1)
+          source.write_text(text)
 
-        source.write_text(text)
+          updated = source.read_text()
 
-        # Verify the function is present exactly once.
-        updated = source.read_text()
+          if updated.count(function_signature) != 1:
+              raise SystemExit("path_umount() insertion verification failed")
 
-        if updated.count(function_signature) != 1:
-            raise SystemExit("path_umount() insertion verification failed")
+          print("path_umount.c inserted successfully.")
+          PY
 
-        print("path_umount.c inserted successfully.")
-        print("Insertion point: immediately before SYSCALL_DEFINE2(umount,")
-        PY
+      - name: Set up rsuntk KernelSU
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Set up rsuntk KernelSU
-      shell: bash
-      run: |
-        set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          curl -LSs \
+            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
+            -o /tmp/ksu-setup.sh
 
-        curl -LSs \
-          https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-          -o /tmp/ksu-setup.sh
+          bash /tmp/ksu-setup.sh main
 
-        bash /tmp/ksu-setup.sh main
+          test -d KernelSU
 
-        test -d KernelSU
+          KSU_VERSION=$(cd KernelSU && expr "$(/usr/bin/git rev-list --count HEAD)" + 10200)
 
-        KSU_VERSION=$(cd KernelSU && expr "$(/usr/bin/git rev-list --count HEAD)" + 10200)
+          echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
 
-        echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+          sed -i 's/ -dirty//g' scripts/setlocalversion
 
-        sed -i 's/ -dirty//g' scripts/setlocalversion
+      - name: Configure kernel
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Configure kernel
-      shell: bash
-      run: |
-        set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
 
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
+          mkdir -p out
 
-        mkdir -p out
+          make O=out ARCH=arm64 vendor/kona-perf_defconfig
 
-        # Load the base SM8250 performance configuration.
-        make O=out ARCH=arm64 vendor/kona-perf_defconfig
+          ARCH=arm64 scripts/kconfig/merge_config.sh \
+            -m \
+            -O out \
+            out/.config \
+            arch/arm64/configs/vendor/debugfs.config
 
-        # Merge the debugfs configuration fragment correctly.
-        ARCH=arm64 scripts/kconfig/merge_config.sh \
-          -m \
-          -O out \
-          out/.config \
-          arch/arm64/configs/vendor/debugfs.config
+          make O=out ARCH=arm64 olddefconfig
 
-        # Resolve configuration dependencies.
-        make O=out ARCH=arm64 olddefconfig
+          cp out/.config out/kernel-config.txt
 
-        # Save the resolved configuration for inspection.
-        cp out/.config out/kernel-config.txt
+          echo "Kernel version:"
+          make O=out ARCH=arm64 kernelversion
 
-        echo "Kernel version:"
-        make O=out ARCH=arm64 kernelversion
+          echo "KernelSU and tracing configuration:"
+          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES' out/.config || true
 
-        echo "KernelSU configuration:"
-        grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES' out/.config || true
+          echo "Configuration completed."
 
-        echo "Configuration completed."
+      - name: Build kernel with rsuntk KernelSU
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Build kernel with rsuntk KernelSU
-      shell: bash
-      run: |
-        set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          echo "=========================================="
+          echo " Qualcomm charger source diagnostics"
+          echo "=========================================="
 
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export BRAND_SHOW_FLAG=oneplus
+          echo "Current directory:"
+          pwd
 
-        export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
+          echo ""
+          echo "Checking schgm-flash files:"
+          ls -la drivers/power/supply/qcom/schgm-flash.* || true
 
-        export KBUILD_BUILD_HOST=Github-Action
-        export KBUILD_BUILD_USER="$(echo '${{ github.actor }}' | tr 'A-Z' 'a-z')"
+          echo ""
+          echo "schgm-flash.c includes:"
+          sed -n '1,45p' drivers/power/supply/qcom/schgm-flash.c
 
-        BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
-        EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
+          echo ""
+          echo "schgm-flash.h:"
+          sed -n '1,100p' drivers/power/supply/qcom/schgm-flash.h
 
-        make -j"$(nproc --all)" \
-          O=out \
-          ARCH=arm64 \
-          CC=clang \
-          $BA_CMD \
-          $EX_CMD
+          echo ""
+          echo "struct smb_charger definitions:"
+          grep -R -n 'struct smb_charger {' \
+            drivers/power/supply/qcom include/linux 2>/dev/null || true
 
-    - name: Verify kernel output
-      shell: bash
-      run: |
-        set -euo pipefail
+          echo ""
+          echo "struct smb_irq_data definitions:"
+          grep -R -n 'struct smb_irq_data {' \
+            drivers/power/supply/qcom include/linux 2>/dev/null || true
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          echo ""
+          echo "smblib_read and smblib_write declarations:"
+          grep -R -n -E 'smblib_(read|write)[[:space:]]*\(' \
+            drivers/power/supply/qcom include/linux 2>/dev/null || true
 
-        IMAGE="out/arch/arm64/boot/Image"
+          echo ""
+          echo "=========================================="
+          echo " Starting kernel build"
+          echo "=========================================="
 
-        if [ ! -s "$IMAGE" ]; then
-          echo "ERROR: Kernel Image was not generated."
-          exit 1
-        fi
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export BRAND_SHOW_FLAG=oneplus
 
-        if [ ! -s out/include/config/kernel.release ]; then
-          echo "ERROR: Kernel release file was not generated."
-          exit 1
-        fi
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
 
-        KERNEL_VERSION="$(cat out/include/config/kernel.release)"
+          export KBUILD_BUILD_HOST=Github-Action
+          export KBUILD_BUILD_USER="$(echo '${{ github.actor }}' | tr 'A-Z' 'a-z')"
 
-        echo "CHECK_IMAGE=true" >> "$GITHUB_ENV"
-        echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+          BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
+          EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
 
-        echo "Kernel build succeeded."
-        echo "Kernel release: $KERNEL_VERSION"
-        file "$IMAGE"
+          make -j"$(nproc --all)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            $BA_CMD \
+            $EX_CMD
 
-    - name: Make AnyKernel3 package
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Verify kernel output
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        cd "$GITHUB_WORKSPACE/kernel_workspace"
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
-        git clone \
-          --depth=1 \
-          https://github.com/rohanbatrain/AnyKernel3-SM8250 \
-          AnyKernel3
+          IMAGE="out/arch/arm64/boot/Image"
 
-        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' \
-          AnyKernel3/anykernel.sh
+          if [ ! -s "$IMAGE" ]; then
+            echo "ERROR: Kernel Image was not generated."
+            exit 1
+          fi
 
-        sed -i \
-          's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' \
-          AnyKernel3/anykernel.sh
+          if [ ! -s out/include/config/kernel.release ]; then
+            echo "ERROR: Kernel release file was not generated."
+            exit 1
+          fi
 
-        sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' \
-          AnyKernel3/anykernel.sh
+          KERNEL_VERSION="$(cat out/include/config/kernel.release)"
 
-        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+          echo "CHECK_IMAGE=true" >> "$GITHUB_ENV"
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
 
-        rm -rf AnyKernel3/.git AnyKernel3/.github
-        rm -f AnyKernel3/README.md
+          echo "Kernel build succeeded."
+          echo "Kernel release: $KERNEL_VERSION"
+          file "$IMAGE"
 
-    - name: Upload kernel Image
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: Image-Android17-LineageOS24
-        path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
-        if-no-files-found: error
+      - name: Make AnyKernel3 package
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    - name: Upload AnyKernel3
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
-        path: kernel_workspace/AnyKernel3/*
-        if-no-files-found: error
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
 
-    - name: Create ZIP packages
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
+          git clone \
+            --depth=1 \
+            https://github.com/rohanbatrain/AnyKernel3-SM8250 \
+            AnyKernel3
 
-        WORKSPACE="$GITHUB_WORKSPACE/kernel_workspace"
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' \
+            AnyKernel3/anykernel.sh
 
-        cd "$WORKSPACE/android-kernel/out/arch/arm64/boot"
-        zip "$GITHUB_WORKSPACE/Image.zip" Image
+          sed -i \
+            's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' \
+            AnyKernel3/anykernel.sh
 
-        cd "$WORKSPACE/AnyKernel3"
+          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' \
+            AnyKernel3/anykernel.sh
 
-        zip -r \
-          "$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip" \
-          ./*
+          cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
 
-    - name: Upload ZIP packages
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: ZIP-Packages-Android17-LineageOS24
-        path: |
-          Image.zip
-          AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip
-        if-no-files-found: error
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+          rm -f AnyKernel3/README.md
 
-    - name: Send AnyKernel3 to Telegram
-      if: ${{ env.CHECK_IMAGE == 'true' }}
-      shell: bash
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-      run: |
-        set -euo pipefail
+      - name: Upload kernel Image
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-Android17-LineageOS24
+          path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
+          if-no-files-found: error
 
-        if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-          echo "Telegram credentials are not configured; skipping Telegram upload."
-          exit 0
-        fi
+      - name: Upload AnyKernel3
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/AnyKernel3/*
+          if-no-files-found: error
 
-        WORKSPACE="$GITHUB_WORKSPACE/kernel_workspace"
+      - name: Create ZIP packages
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        AK3_ZIP="$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip"
+          WORKSPACE="$GITHUB_WORKSPACE/kernel_workspace"
 
-        test -s "$AK3_ZIP"
-        test -s "$GITHUB_WORKSPACE/Image.zip"
+          cd "$WORKSPACE/android-kernel/out/arch/arm64/boot"
+          zip "$GITHUB_WORKSPACE/Image.zip" Image
 
-        caption2="\
-        <blockquote><a href=\"https://github.com/rsuntk/KernelSU\"><b>Unofficial KernelSU (rsuntk)</b> - ${KSUVER}</a></blockquote>
+          cd "$WORKSPACE/AnyKernel3"
 
-        ROM:<blockquote><b>LineageOS 24 / Android 17 target</b></blockquote>
-        Device:<blockquote>OnePlus 8 | OnePlus 8 Pro | OnePlus 8T | OnePlus 9R</blockquote>
-        Kernel Version:<blockquote>${KERNEL_VERSION}</blockquote>
-        Build Time:<blockquote>${BUILD_TIME_1}</blockquote>
-        Special Note:
-        <blockquote>Use the matching unofficial KernelSU manager if required.</blockquote>
+          zip -r \
+            "$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip" \
+            ./*
 
-        <a href=\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\">GitHub Actions Build</a>"
+      - name: Upload ZIP packages
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZIP-Packages-Android17-LineageOS24
+          path: |
+            Image.zip
+            AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip
+          if-no-files-found: error
 
-        media=$(jq -n \
-          --arg media1 "attach://anykernel3" \
-          --arg media2 "attach://Image" \
-          --arg caption2 "$caption2" \
-          '[
-            {
-              type: "document",
-              media: $media1
-            },
-            {
-              type: "document",
-              media: $media2,
-              caption: $caption2,
-              parse_mode: "HTML"
-            }
-          ]')
+      - name: Send AnyKernel3 to Telegram
+        if: ${{ env.CHECK_IMAGE == 'true' }}
+        shell: bash
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
 
-        curl --fail-with-body --silent --show-error \
-          "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMediaGroup" \
-          -F "chat_id=${TELEGRAM_CHAT_ID}" \
-          -F "media=${media}" \
-          -F "anykernel3=@${AK3_ZIP}" \
-          -F "Image=@${GITHUB_WORKSPACE}/Image.zip"
+          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram credentials are not configured; skipping Telegram upload."
+            exit 0
+          fi
+
+          AK3_ZIP="$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip"
+
+          test -s "$AK3_ZIP"
+          test -s "$GITHUB_WORKSPACE/Image.zip"
+
+          caption2="\
+          <blockquote><a href=\"https://github.com/rsuntk/KernelSU\"><b>Unofficial KernelSU (rsuntk)</b> - ${KSUVER}</a></blockquote>
+
+          ROM:<blockquote><b>LineageOS 24 / Android 17 target</b></blockquote>
+          Device:<blockquote>OnePlus 8 | OnePlus 8 Pro | OnePlus 8T | OnePlus 9R</blockquote>
+          Kernel Version:<blockquote>${KERNEL_VERSION}</blockquote>
+          Build Time:<blockquote>${BUILD_TIME_1}</blockquote>
+          Special Note:
+          <blockquote>Use the matching unofficial KernelSU manager if required.</blockquote>
+
+          <a href=\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\">GitHub Actions Build</a>"
+
+          media=$(jq -n \
+            --arg media1 "attach://anykernel3" \
+            --arg media2 "attach://Image" \
+            --arg caption2 "$caption2" \
+            '[
+              {
+                type: "document",
+                media: $media1
+              },
+              {
+                type: "document",
+                media: $media2,
+                caption: $caption2,
+                parse_mode: "HTML"
+              }
+            ]')
+
+          curl --fail-with-body --silent --show-error \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMediaGroup" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "media=${media}" \
+            -F "anykernel3=@${AK3_ZIP}" \
+            -F "Image=@${GITHUB_WORKSPACE}/Image.zip"
