@@ -18,18 +18,18 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set swap to 10G
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 10
-    
+
     - name: Setup build kernel environment
       run: |
         echo "BUILD_TIME=$(TZ=Asia/Kolkata date "+%y%m%d")" >> $GITHUB_ENV
         echo "BUILD_TIME_1=$(TZ=Asia/Kolkata date "+%Y-%m-%d")" >> $GITHUB_ENV
         sudo apt-get update
-        sudo apt-get install git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: Cache Clang toolchain
@@ -63,11 +63,13 @@ jobs:
         wget -O gcc-aarch64.tar.gz \
           https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz
         tar -C gcc-64 -zxvf gcc-aarch64.tar.gz
-    
+
     - name: Download kernel source
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone --recursive https://github.com/rohanbatrain/android_kernel_oneplus_sm8250 -b lineage-22.2 android-kernel --depth=1
+        git clone --recursive \
+          https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
+          -b lineage-24.0 android-kernel --depth=1
 
     - name: Set up rsuntk KernelSU
       run: |
@@ -89,24 +91,27 @@ jobs:
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
+
         BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
         EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
-        DEFCONFIG="vendor/kona-perf_defconfig vendor/debugfs.config"
+
+        DEFCONFIG="vendor/kona-perf_defconfig vendor/oplus.config"
+
         make O=out ARCH=arm64 CC=clang $BA_CMD $EX_CMD $DEFCONFIG
         make -j$(nproc --all) O=out ARCH=arm64 CC=clang $BA_CMD $EX_CMD
-    
+
     - name: Check a kernel output files with rsuntk KernelSU
       run: |
-       cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out
-       if [ -f arch/arm64/boot/Image ]; then
-           echo "CHECK_IMAGE=true" >> $GITHUB_ENV
-           KERNEL_VERSION=$(cat include/config/kernel.release)
-           echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
-       else
-           echo "Kernel output file is empty"
-           exit 1
-       fi
-      
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out
+        if [ -f arch/arm64/boot/Image ]; then
+            echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+            KERNEL_VERSION=$(cat include/config/kernel.release)
+            echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+        else
+            echo "Kernel output file is empty"
+            exit 1
+        fi
+
     - name: Make AnyKernel3 with rsuntk KernelSU
       if: ${{ env.CHECK_IMAGE == 'true' }}
       run: |
@@ -122,21 +127,21 @@ jobs:
       if: ${{ env.CHECK_IMAGE == 'true' }}
       uses: actions/upload-artifact@v4
       with:
-        name: Image
+        name: Image-Android17
         path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
 
     - name: Upload AnyKernel3
       if: ${{ env.CHECK_IMAGE == 'true' }}
       uses: actions/upload-artifact@v4
       with:
-        name: AK3-LineageOS_22-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
+        name: AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
         path: kernel_workspace/AnyKernel3/*
-    
+
     - name: Zip files
       run: |
         zip -r Image.zip $GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/arm64/boot/Image
         cd $GITHUB_WORKSPACE/kernel_workspace/AnyKernel3
-        zip -r $GITHUB_WORKSPACE/AK3-LineageOS_22-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip ./*
+        zip -r $GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip ./*
 
     - name: Send AnyKernel3 to Telegram
       env:
@@ -145,23 +150,25 @@ jobs:
       run: |
         caption2="\
         <blockquote><a href=\"https://github.com/rsuntk/KernelSU\"><b>Unofficial KernelSU (rsuntk)</b> - ${{ env.KSUVER }}</a></blockquote>
-        
-        ROM:<blockquote><b>LineageOS 22</b></blockquote>
+
+        ROM:<blockquote><b>LineageOS 24 / Android 17</b></blockquote>
         Device:<blockquote>OnePlus 8 | OnePlus 8 Pro | OnePlus 8T | OnePlus 9R</blockquote>
         Kernel Version:<blockquote>${{ env.KERNEL_VERSION }}</blockquote>
         Build Time:<blockquote>${{ env.BUILD_TIME_1 }}</blockquote>
         Special Note:
         <blockquote>The unofficial version is recommended to install an <a href=\"https://github.com/rsuntk/KernelSU/releases\">unofficial manager</a></blockquote>
         Change Log:<blockquote>Update rsuntk KernelSU to version 1.0.5.</blockquote>
-        
+
         <a href=\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\">Github Action</a>"
+
         media=$(jq -n \
           --arg media1 "attach://anykernel3" \
           --arg media2 "attach://Image" \
           --arg caption2 "$caption2" \
           '[{type: "document", media: $media1, parse_mode: "HTML"},
             {type: "document", media: $media2, caption: $caption2, parse_mode: "HTML"}]')
+
         curl "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMediaGroup?chat_id=$TELEGRAM_CHAT_ID" \
             -F "media=$media" \
-            -F anykernel3="@$GITHUB_WORKSPACE/AK3-LineageOS_22-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip" \
+            -F anykernel3="@$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip" \
             -F Image="@$GITHUB_WORKSPACE/Image.zip"
