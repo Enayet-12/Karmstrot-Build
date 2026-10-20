@@ -1,4 +1,4 @@
-name: Build LOS24 Kernel with SukiSU-Ultra + SUSFS (Non-GKI)
+name: Build LOS24 Kernel with rsuntk KernelSU + SUSFS (Non-GKI)
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ permissions:
 env:
   KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
   KERNEL_BRANCH: lineage-24.0
-  # Use SukiSU-Ultra's manual-hook branch for a hand-patched non-GKI 4.19 kernel.
-  KSU_BRANCH: builtin
+  # rsuntk KernelSU main branch; non-GKI manual hooks are enabled in the defconfig step.
+  KSU_BRANCH: main
   KPM_PATCH_VERSION: 0.13.9
 
 jobs:
@@ -57,27 +57,23 @@ jobs:
           git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
           git -C kernel log -1 --oneline
 
-      - name: Integrate SukiSU-Ultra builtin (includes SUSFS support)
+      - name: Integrate rsuntk KernelSU (RKSU)
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/kernel"
           curl -fLSs --retry 3 \
-            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
-            -o /tmp/sukisu-setup.sh
-          bash /tmp/sukisu-setup.sh "$KSU_BRANCH"
-          # setup.sh can print a fallback message while returning success if
-          # checkout fails. Do not silently continue on the main/GKI-oriented branch.
-          ACTUAL_KSU_BRANCH="$(git -C KernelSU branch --show-current)"
-          if [ "$ACTUAL_KSU_BRANCH" != "$KSU_BRANCH" ]; then
-            echo "ERROR: expected SukiSU branch '$KSU_BRANCH', got '$ACTUAL_KSU_BRANCH'. Refusing a GKI/main-branch build." >&2
-            git -C KernelSU status --short --branch >&2 || true
-            exit 1
-          fi
-          git -C KernelSU log -1 --oneline
+            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
+            -o /tmp/rksu-setup.sh
+          bash /tmp/rksu-setup.sh "$KSU_BRANCH"
           test -d KernelSU/kernel
           test -e drivers/kernelsu
           grep -q 'kernelsu' drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
+          echo '========== KernelSU source identity =========='
+          git -C KernelSU remote -v
+          git -C KernelSU log -1 --oneline
+          git -C KernelSU remote get-url origin | grep -Eq 'rsuntk/KernelSU'
+          test "$(git -C KernelSU branch --show-current)" = "$KSU_BRANCH"
 
       - name: Backport seccomp syscall-count definition for Linux 4.19 when needed
         run: |
@@ -89,9 +85,9 @@ jobs:
 
           root = Path("drivers/kernelsu")
           if not root.exists():
-              raise SystemExit(f"SukiSU integration directory not found: {root}")
+              raise SystemExit(f"KernelSU integration directory not found: {root}")
 
-          # Do not assume a particular SukiSU directory layout. Patch only
+          # Do not assume a particular KernelSU directory layout. Patch only
           # compiled-tree source files that actually reference this macro.
           candidates = [p for p in root.rglob("*.c") if p.is_file()]
           targets = []
@@ -103,7 +99,7 @@ jobs:
                   targets.append((path, source))
 
           if not targets:
-              print("No unresolved SECCOMP_ARCH_NATIVE_NR use in drivers/kernelsu; no patch needed for this SukiSU revision.")
+              print("No unresolved SECCOMP_ARCH_NATIVE_NR use in drivers/kernelsu; no patch needed for this KernelSU revision.")
           else:
               for path, source in targets:
                   include = "#include <linux/seccomp.h>"
@@ -140,7 +136,7 @@ jobs:
           guarded = "#ifdef MODULE_IMPORT_NS\n" + line + "\n#endif /* MODULE_IMPORT_NS */"
           candidates = [p for p in root.rglob("*.c") if p.is_file() and line in p.read_text(errors="ignore")]
           if not candidates:
-              print("No MODULE_IMPORT_NS import found in this SukiSU revision; nothing to backport.")
+              print("No MODULE_IMPORT_NS import found in this KernelSU revision; nothing to backport.")
           else:
               for path in candidates:
                   source = path.read_text()
@@ -168,7 +164,7 @@ jobs:
                             ("ksu_wrapper_iopoll" in p.read_text(errors="ignore") or
                              "ksu_wrapper_remap_file_range" in p.read_text(errors="ignore"))]
               if not candidates:
-                  print("No unsupported iopoll/remap_file_range wrappers in this SukiSU revision; skipping.")
+                  print("No unsupported iopoll/remap_file_range wrappers in this KernelSU revision; skipping.")
                   raise SystemExit(0)
               if len(candidates) != 1:
                   raise SystemExit("Found wrapper definitions in multiple files; refusing an ambiguous edit: " + ", ".join(map(str, candidates)))
@@ -334,7 +330,7 @@ jobs:
                   total += count
                   print(f"Updated {count} access_ok call(s) in {path}")
           if total == 0:
-              print("No newer two-argument access_ok calls found in SukiSU source; no patch needed.")
+              print("No newer two-argument access_ok calls found in KernelSU source; no patch needed.")
           else:
               print(f"Updated {total} access_ok call(s) for the Linux 4.19 three-argument API.")
           PYCODE
@@ -659,7 +655,7 @@ jobs:
                             ("CMD_SUSFS_ADD_SUS_PATH" in p.read_text(errors="ignore") or
                              "susfs_add_sus_path(" in p.read_text(errors="ignore"))]
               if not candidates:
-                  print("No SUSFS dispatch implementation found in this SukiSU layout; skipping dispatch adaptation.")
+                  print("No SUSFS dispatch implementation found in this KernelSU layout; skipping dispatch adaptation.")
                   raise SystemExit(0)
               if len(candidates) != 1:
                   raise SystemExit("Ambiguous SUSFS dispatch files: " + ", ".join(map(str, candidates)))
@@ -806,7 +802,7 @@ jobs:
               sed -i '1i#include <linux/susfs_ksu_compat.h>' "$DISPATCH"
             fi
           else
-            echo "No SUSFS dispatch source found in this SukiSU layout; skipping dispatch include injection."
+            echo "No SUSFS dispatch source found in this KernelSU layout; skipping dispatch include injection."
           fi
 
           # SELinux-hide needs kernel internals unavailable in Linux 4.19.
@@ -830,137 +826,6 @@ jobs:
           path: ${{ github.workspace }}/susfs-diagnostics/
           if-no-files-found: warn
           retention-days: 7
-
-      - name: Adapt SukiSU v4.2.1 to Linux 4.19 and SUSFS v1.5.5 APIs
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel"
-          python3 - <<'PYCODE'
-          from pathlib import Path
-          import re
-
-          root = Path("drivers/kernelsu")
-          if not root.is_dir():
-              raise SystemExit("SukiSU source directory is missing")
-
-          # 1) Linux 4.19 struct clocksource has no vdso_clock_mode member.
-          # Disable only this newer VDSO-specific assignment when the actual
-          # kernel header does not provide the field; retain the rest of CPU spoof.
-          clocksource_h = Path("include/linux/clocksource.h").read_text(errors="replace")
-          if "vdso_clock_mode" not in clocksource_h:
-              candidates = [p for p in root.rglob("*.c") if "vdso_clock_mode" in p.read_text(errors="ignore")]
-              for path in candidates:
-                  source = path.read_text()
-                  source, count = re.subn(r"\(\*curr_cs_ptr\)->vdso_clock_mode\s*=\s*[^;]+;", "/* VDSO clock-mode spoofing unavailable on this Linux 4.19 clocksource API. */", source, flags=re.S)
-                  if count == 0 and "vdso_clock_mode" in source:
-                      raise SystemExit(f"Found vdso_clock_mode in {path}, but could not safely isolate its assignment")
-                  path.write_text(source)
-                  print(f"Disabled {count} unsupported VDSO clock-mode assignment(s) in {path}")
-
-          # 2) Remove the SELinux-hide feature-table entry only if this checkout
-          # has no actual enum declaration for it. Also guard runtime call sites;
-          # this older kernel integration does not provide those functions.
-          feature_c = root / "policy/feature.c"
-          # The compiler has confirmed this enum value is unavailable in this
-          # checkout. Remove only its designated feature-table row; do not
-          # invent an enum value or alias it to an unrelated feature.
-          if feature_c.is_file():
-              source = feature_c.read_text()
-              source, count = re.subn(
-                  r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\][^\n]*\n", "", source
-              )
-              feature_c.write_text(source)
-              print(f"Removed {count} unsupported SELinux-hide feature-table entry/entries")
-              if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", source):
-                  raise SystemExit("Unsupported KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
-
-          # Some SELinux policy helpers are compiled with optional policy code
-          # disabled on older trees. Mark the policy pointers as maybe-unused so
-          # -Werror does not fail a build when those branches compile out.
-          for path in root.rglob("rules.c"):
-              source = path.read_text(errors="ignore")
-              patched, count = re.subn(
-                  r"(?m)^([ \t]*)struct selinux_policy \*pol, \*old_pol;[ \t]*$",
-                  r"\1struct selinux_policy *pol __maybe_unused, *old_pol __maybe_unused;",
-                  source
-              )
-              if count:
-                  path.write_text(patched)
-                  print(f"Marked {count} conditionally unused SELinux policy pointer declaration(s) in {path}")
-
-          for path in root.rglob("*.c"):
-              source = path.read_text(errors="ignore")
-              original = source
-              for call in ("ksu_selinux_hide_handle_post_fs_data", "ksu_selinux_hide_handle_second_stage"):
-                  # These APIs are absent from this SukiSU/Linux 4.19 source combination.
-                  source = re.sub(r"^(\s*)" + re.escape(call) + r"\(\);\s*$",
-                                  r"\1/* SELinux-hide hook unavailable in this kernel integration. */", source, flags=re.M)
-              if source != original:
-                  path.write_text(source)
-                  print(f"Disabled unavailable SELinux-hide hook call(s) in {path}")
-
-          # 3) SUSFS v1.5.5 uses this userspace ABI magic, but its kernel headers
-          # do not define the constant consumed by SukiSU's supercall dispatcher.
-          compat = Path("include/linux/susfs_ksu_compat.h")
-          if compat.is_file():
-              source = compat.read_text()
-              if "#define SUSFS_MAGIC" not in source:
-                  source = source.replace("#define KSU_SUSFS_COMPAT_H\n",
-                                          "#define KSU_SUSFS_COMPAT_H\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xFAFAFAFAU\n#endif\n", 1)
-                  compat.write_text(source)
-                  print("Added the documented SUSFS userspace ABI magic to the compatibility header")
-
-          # 4) These per-process state APIs are not implemented by the kernel-4.19
-          # SUSFS v1.5.5 source. Keep the call sites available for a future matching
-          # SUSFS implementation, but do not compile calls to absent symbols.
-          missing_state_apis = (
-              "susfs_set_current_proc_no_su",
-              "susfs_set_current_proc_umounted",
-              "susfs_set_current_proc_umounted_for_zygote_next",
-          )
-          for path in root.rglob("*.c"):
-              source = path.read_text(errors="ignore")
-              original = source
-              for api in missing_state_apis:
-                  # Guard individual call statements. This is not a fake function or
-                  # success stub; the newer per-process state feature is disabled.
-                  source = re.sub(r"^(\s*)" + re.escape(api) + r"\(\);\s*$",
-                                  r"#ifdef CONFIG_KSU_SUSFS_TASK_STATE_API\n\1" + api + r"();\n#endif /* CONFIG_KSU_SUSFS_TASK_STATE_API */",
-                                  source, flags=re.M)
-              if source != original:
-                  path.write_text(source)
-                  print(f"Guarded unsupported SUSFS task-state calls in {path}")
-
-          # 5) The newer adb-root helper names are not exported by SUSFS v1.5.5.
-          # Replace them with local, real string comparisons (not SUSFS stubs).
-          adb_candidates = [p for p in root.rglob("adb_root.c") if "susfs_starts_with" in p.read_text(errors="ignore") or "susfs_ends_with" in p.read_text(errors="ignore")]
-          for path in adb_candidates:
-              source = path.read_text()
-              if "ksu_compat_path_starts_with" not in source:
-                  includes = list(re.finditer(r"^#include[^\n]*\n", source, flags=re.M))
-                  insert_at = includes[-1].end() if includes else 0
-                  helpers = (
-                      "\n#include <linux/string.h>\n"
-                      "static bool ksu_compat_path_starts_with(const char *s, const char *prefix)\n"
-                      "{ return s && prefix && !strncmp(s, prefix, strlen(prefix)); }\n"
-                      "static bool ksu_compat_path_ends_with(const char *s, const char *suffix)\n"
-                      "{ size_t sl, pl; if (!s || !suffix) return false; sl = strlen(s); pl = strlen(suffix); return sl >= pl && !strcmp(s + sl - pl, suffix); }\n"
-                  )
-                  source = source[:insert_at] + helpers + source[insert_at:]
-              source = source.replace("susfs_starts_with(", "ksu_compat_path_starts_with(")
-              source = source.replace("susfs_ends_with(", "ksu_compat_path_ends_with(")
-              path.write_text(source)
-              print(f"Replaced unavailable SUSFS string helpers in {path}")
-
-          # Ensure the unresolved identifiers from the reported build are either
-          # genuinely handled or reported as an explicit integration limitation.
-          feature_source = feature_c.read_text(errors="ignore") if feature_c.is_file() else ""
-          if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", feature_source):
-              raise SystemExit("KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
-          print("Compatibility pass complete. Note: SUSFS v1.5.5 cannot provide the newer per-process task-state or SELinux-hide features without a matching implementation.")
-          PYCODE
-          echo "::warning::SUSFS v1.5.5 lacks SukiSU's newer per-process task-state APIs; those hooks are conditionally disabled rather than replaced with fake stubs."
-          echo "::warning::SELinux-hide hooks and VDSO clock-mode spoofing are unavailable in this Linux 4.19 source combination."
 
       - name: Fix MSM driver strnstr API call
         run: |
@@ -988,96 +853,6 @@ jobs:
           if total == 0:
               print("No matching two-argument MSM strnstr call found; this source revision needs no patch.")
           PYCODE
-
-      - name: Audit version-sensitive SukiSU APIs against Linux 4.19 source
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel"
-          python3 - <<'PYCODE'
-          from pathlib import Path
-          import re
-
-          root = Path(".")
-          ksu = root / "drivers/kernelsu"
-          if not ksu.exists():
-              raise SystemExit("drivers/kernelsu is missing; SukiSU integration did not complete")
-
-          # This is a targeted inventory, not a claim that static scanning can
-          # prove full API compatibility. The compiler remains authoritative.
-          symbols = [
-              "SECCOMP_ARCH_NATIVE_NR", "NR_syscalls", "MODULE_IMPORT_NS",
-              "access_ok", "strnstr", "iopoll", "remap_file_range",
-              "ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range",
-              "SUSFS_MAGIC", "KSU_FEATURE_SELINUX_HIDE",
-              "susfs_start_sdcard_monitor_fn", "susfs_enable_log",
-              "susfs_set_cmdline_or_bootconfig",
-              "CMD_SUSFS_ADD_SUS_PATH_LOOP",
-              "susfs_add_sus_path_loop",
-              "CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS",
-          ]
-          source_exts = {".c", ".h", ".S", ".s", ".inc"}
-          ksu_files = [p for p in ksu.rglob("*") if p.is_file() and p.suffix in source_exts]
-          kernel_files = [p for p in root.rglob("*") if p.is_file() and p.suffix in source_exts
-                          and ".git" not in p.parts and "out" not in p.parts]
-
-          # Read source files once; repeatedly reopening the entire kernel tree
-          # for every symbol would make this audit unnecessarily slow.
-          def load_lines(files):
-              loaded = []
-              for file in files:
-                  try:
-                      loaded.append((file, file.read_text(errors="ignore").splitlines()))
-                  except OSError:
-                      pass
-              return loaded
-
-          ksu_sources = load_lines(ksu_files)
-          kernel_sources = load_lines(kernel_files)
-
-          report = [
-              "# SukiSU / Linux 4.19 API compatibility inventory", "",
-              "This is a heuristic source inventory. Presence of a token does not prove API compatibility; absence does not prove a build failure.",
-              "Review each occurrence and use the compiler log for authoritative diagnostics.", "",
-          ]
-          for symbol in symbols:
-              uses = []
-              for f, lines in ksu_sources:
-                  for number, line in enumerate(lines, 1):
-                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
-                          uses.append(f"{f}:{number}: {line.strip()}")
-              if not uses:
-                  continue
-              found_outside_ksu = []
-              for f, lines in kernel_sources:
-                  if f.is_relative_to(ksu):
-                      continue
-                  for number, line in enumerate(lines, 1):
-                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
-                          found_outside_ksu.append(f"{f}:{number}: {line.strip()}")
-              report += [f"## `{symbol}`", "", "SukiSU occurrences:"]
-              report += [f"- `{x}`" for x in uses[:30]]
-              if len(uses) > 30:
-                  report.append(f"- ... {len(uses) - 30} additional occurrence(s)")
-              report += ["", "Occurrences elsewhere in the kernel tree (may be declarations, uses, or comments):"]
-              report += [f"- `{x}`" for x in found_outside_ksu[:30]] if found_outside_ksu else ["- No matching token found outside SukiSU."]
-              if len(found_outside_ksu) > 30:
-                  report.append(f"- ... {len(found_outside_ksu) - 30} additional occurrence(s)")
-              report.append("")
-
-          import os
-          out = Path(os.environ["GITHUB_WORKSPACE"]) / "sukisu-linux419-api-audit.md"
-          out.write_text("\n".join(report) + "\n")
-          print(f"Wrote compatibility inventory: {out}")
-          PYCODE
-
-      - name: Upload SukiSU Linux 4.19 API audit
-        if: always() && hashFiles('sukisu-linux419-api-audit.md') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: sukisu-linux419-api-audit-${{ github.run_number }}
-          path: ${{ github.workspace }}/sukisu-linux419-api-audit.md
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Configure kernel
         run: |
@@ -1119,9 +894,15 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CC=clang olddefconfig
 
           scripts/config --file out/.config -e KSU
+          scripts/config --file out/.config -e KSU_MANUAL_HOOK
           scripts/config --file out/.config -e KALLSYMS
           scripts/config --file out/.config -e KALLSYMS_ALL
-          scripts/config --file out/.config -e KPM
+          if grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' drivers/kernelsu KernelSU/kernel 2>/dev/null; then
+            scripts/config --file out/.config -e KPM
+            echo 'This KernelSU source declares CONFIG_KPM; enabling it.'
+          else
+            echo 'This rsuntk KernelSU source does not declare CONFIG_KPM; KPM is handled only by the post-build KernelPatch step.'
+          fi
           scripts/config --file out/.config -e KSU_SUSFS
           scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH
           scripts/config --file out/.config -e KSU_SUSFS_SUS_MOUNT
@@ -1142,7 +923,10 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CC=clang olddefconfig
           grep -E 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_KSU_SUSFS' out/.config || true
           grep -q '^CONFIG_KSU=y' out/.config
-          grep -q '^CONFIG_KPM=y' out/.config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config
+          if grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' drivers/kernelsu KernelSU/kernel 2>/dev/null; then
+            grep -q '^CONFIG_KPM=y' out/.config
+          fi
           grep -q '^CONFIG_KALLSYMS=y' out/.config
           grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
           grep -q '^CONFIG_KSU_SUSFS=y' out/.config
@@ -1153,105 +937,6 @@ jobs:
           # Confirm the kernel-side SUSFS source and Makefile integration exist.
           test -s fs/susfs.c
           grep -q 'susfs' fs/Makefile
-
-      - name: Fix Qualcomm charger build for the selected charging stack
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/kernel"
-
-          MAKEFILE="drivers/power/supply/qcom/Makefile"
-          CONFIG="out/.config"
-          test -s "$MAKEFILE"
-          test -s "$CONFIG"
-          test -s drivers/power/supply/qcom/schgm-flash.c
-          test -s drivers/power/supply/qcom/smb5-lib.h
-
-          echo "========== Selected charging configuration =========="
-          grep -E '^(CONFIG_OPLUS_SM8250_CHARGER|CONFIG_QPNP_SMB5|CONFIG_MFD_SPMI_PMIC)=' "$CONFIG" || true
-          echo "========== Original Qualcomm charger object rules =========="
-          sed -n '1,45p' "$MAKEFILE"
-
-          python3 - <<'PYCODE'
-          from pathlib import Path
-          import re
-
-          makefile = Path("drivers/power/supply/qcom/Makefile")
-          config = Path("out/.config").read_text()
-          source = makefile.read_text()
-
-          oplus_enabled = bool(re.search(r"^CONFIG_OPLUS_SM8250_CHARGER=[ym]$", config, re.M))
-          qpnp_enabled = bool(re.search(r"^CONFIG_QPNP_SMB5=[ym]$", config, re.M))
-
-          # Kbuild treats the Makefile's #ifdef/#else-looking lines as comments.
-          # Only the non-commented CONFIG_QPNP_SMB5 object assignment is active.
-          active_pattern = re.compile(
-              r"(?m)^(?![ \t]*#)([ \t]*obj-\$\(CONFIG_QPNP_SMB5\)[ \t]*\+=.*)$"
-          )
-          active = list(active_pattern.finditer(source))
-          if len(active) != 1:
-              raise SystemExit(
-                  f"Expected exactly one active CONFIG_QPNP_SMB5 object rule; found {len(active)}. "
-                  "Refusing an ambiguous Makefile edit."
-              )
-
-          if oplus_enabled:
-              # OPLUS supplies its own primary charger implementation. The
-              # standalone schgm-flash driver expects the generic SMB5 core
-              # structures/APIs, which are omitted in this OPLUS arrangement.
-              # Exclude only this auxiliary flash/torch driver; retain the OPLUS
-              # charger and fail if its required SPMI foundation is unavailable.
-              if not re.search(r"^CONFIG_MFD_SPMI_PMIC=[ym]$", config, re.M):
-                  raise SystemExit(
-                      "OPLUS charger is enabled but CONFIG_MFD_SPMI_PMIC is not enabled; "
-                      "refusing to build with an incomplete charger stack."
-                  )
-              replacement = (
-                  "obj-$(CONFIG_QPNP_SMB5) += step-chg-jeita.o battery.o "
-                  "pmic-voter.o storm-watch.o"
-              )
-              mode = "OPLUS charger stack"
-          elif qpnp_enabled:
-              # Otherwise build the complete standard Qualcomm SMB5 stack,
-              # including the definitions and helpers required by schgm-flash.
-              replacement = (
-                  "obj-$(CONFIG_QPNP_SMB5) += step-chg-jeita.o battery.o "
-                  "qpnp-smb5.o smb5-lib.o pmic-voter.o storm-watch.o schgm-flash.o"
-              )
-              mode = "standard Qualcomm SMB5 charger stack"
-          else:
-              raise SystemExit(
-                  "Neither CONFIG_OPLUS_SM8250_CHARGER nor CONFIG_QPNP_SMB5 is enabled. "
-                  "Refusing to build without a verified primary charger implementation."
-              )
-
-          match = active[0]
-          makefile.write_text(source[:match.start(1)] + replacement + source[match.end(1):])
-
-          final = makefile.read_text()
-          active_final = list(active_pattern.finditer(final))
-          if len(active_final) != 1:
-              raise SystemExit("Active Qualcomm charger object rule count changed unexpectedly.")
-          active_line = active_final[0].group(1)
-
-          if oplus_enabled:
-              if "schgm-flash.o" in active_line:
-                  raise SystemExit("OPLUS mode still builds the incompatible schgm-flash.o.")
-              if "qpnp-smb5.o" in active_line or "smb5-lib.o" in active_line:
-                  raise SystemExit("OPLUS mode unexpectedly builds the generic SMB5 core.")
-              if not re.search(r"^CONFIG_OPLUS_SM8250_CHARGER=[ym]$", config, re.M):
-                  raise SystemExit("OPLUS primary charger configuration is not enabled.")
-          else:
-              for obj in ("qpnp-smb5.o", "smb5-lib.o", "schgm-flash.o"):
-                  if obj not in active_line:
-                      raise SystemExit(f"Standard SMB5 mode is missing required object {obj}.")
-
-          print(f"Selected charging stack: {mode}")
-          print(f"Verified active object rule: {active_line}")
-          PYCODE
-
-          echo "========== Final Qualcomm charger object rules =========="
-          sed -n '1,45p' "$MAKEFILE"
-          echo "Charging-stack configuration verified."
 
       - name: Resolve duplicate OnePlus display and Synaptics symbols
         run: |
@@ -1298,6 +983,17 @@ jobs:
               print("Oplus Synaptics response completion already has internal linkage")
           PYCODE
 
+      - name: Diagnose Qualcomm charger source/header mismatch
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          echo '========== Charger configuration =========='
+          grep -E '^(CONFIG_QPNP_SMB5|CONFIG_OPLUS_SM8250_CHARGER|CONFIG_MFD_SPMI_PMIC)=' out/.config || true
+          echo '========== Qualcomm charger object rules =========='
+          sed -n '1,80p' drivers/power/supply/qcom/Makefile
+          echo '========== SMB5 type declarations =========='
+          grep -R -n -E 'struct smb_charger[[:space:]]*\{|struct smb_irq_data[[:space:]]*\{' drivers/power/supply/qcom --include='*.h' --include='*.c' || true
+
       - name: Resolve final-link SUSFS and DRM dependencies
         run: |
           set -euxo pipefail
@@ -1319,13 +1015,13 @@ jobs:
               susfs.write_text(source)
               print("Mapped namespace try-umount entry point to SUSFS 1.5.5 implementation")
 
-          # SukiSU builtin's kernel_umount.c provides the real path_umount helper
+          # KernelSU builtin's kernel_umount.c provides the real path_umount helper
           # internally, but SUSFS 1.5.5 expects it exported as ksu_try_umount.
           umount = Path("drivers/kernelsu/feature/kernel_umount.c")
           if not umount.is_file():
               candidates = list(Path("drivers/kernelsu").rglob("kernel_umount.c"))
               if len(candidates) != 1:
-                  raise SystemExit("Could not uniquely locate SukiSU kernel_umount.c")
+                  raise SystemExit("Could not uniquely locate KernelSU kernel_umount.c")
               umount = candidates[0]
           source = umount.read_text()
           helper = "\n/* SUSFS 1.5.5 calls this helper for its registered try-umount paths. */\nvoid ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)\n{\n    const struct cred *saved;\n    (void)check_mnt; /* SUSFS 1.5.5 passes false for these calls. */\n    (void)uid;       /* Target uid is policy context, not caller credentials. */\n    if (!ksu_cred || !mnt)\n        return;\n    saved = override_creds(ksu_cred);\n    try_umount(mnt, flags);\n    revert_creds(saved);\n}\n"
@@ -1337,7 +1033,7 @@ jobs:
                   raise SystemExit(f"Cannot safely locate try_umount insertion point in {umount}")
               source = source[:pos] + helper + source[pos:]
               umount.write_text(source)
-              print(f"Exported SUSFS-compatible umount adapter using SukiSU's real path_umount implementation in {umount}")
+              print(f"Exported SUSFS-compatible umount adapter using KernelSU's real path_umount implementation in {umount}")
 
           # SUSFS 1.5.5 does not provide the newer susfs_extra_works work item.
           # Remove only the scheduling dependency; do not fabricate an empty work.
@@ -1345,7 +1041,7 @@ jobs:
           if not lsm.is_file():
               candidates = list(Path("drivers/kernelsu").rglob("lsm_hook.c"))
               if len(candidates) != 1:
-                  raise SystemExit("Could not uniquely locate SukiSU lsm_hook.c")
+                  raise SystemExit("Could not uniquely locate KernelSU lsm_hook.c")
               lsm = candidates[0]
           source = lsm.read_text()
           source = re.sub(r"(?m)^\s*extern struct work_struct susfs_extra_works;\s*\n", "", source)
@@ -1483,7 +1179,7 @@ jobs:
           sed -i 's|^block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
           sed -i 's/^is_slot_device=.*/is_slot_device=1;/' anykernel.sh
 
-          ZIP_NAME="SukiSU-Ultra-SUSFS_OnePlus8Pro_LOS24_$(date -u +%Y%m%d).zip"
+          ZIP_NAME="RKSU-SUSFS_OnePlus8Pro_LOS24_$(date -u +%Y%m%d).zip"
           zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '.git/*' 'README.md' '*placeholder*'
           test -s "$GITHUB_WORKSPACE/$ZIP_NAME"
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
@@ -1499,12 +1195,12 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: sukisu-susfs-los24-${{ github.run_number }}
-          name: SukiSU-Ultra + SUSFS LOS24 Build ${{ github.run_number }}
+          tag_name: rksu-susfs-los24-${{ github.run_number }}
+          name: rsuntk KernelSU + SUSFS LOS24 Build ${{ github.run_number }}
           body: |
             Automated OnePlus 8 Pro kernel build for the LineageOS 24.0 branch.
 
-            Includes SukiSU-Ultra builtin, its integrated SUSFS options, and KPM.
+            Includes rsuntk KernelSU with SUSFS integration and the configured KPM patch step.
 
             Install the AnyKernel3 ZIP from custom recovery only after confirming the device and ROM compatibility. Keep a known-good boot image available before flashing.
           files: ${{ github.workspace }}/${{ env.ZIP_NAME }}
