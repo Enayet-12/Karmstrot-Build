@@ -1,515 +1,1512 @@
-name: Build Karmstrot_AK (OPlus SM8250 Kernel)
+name: Build LOS24 Kernel with SukiSU-Ultra + SUSFS (Non-GKI)
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
-  TZ: Asia/Kolkata
+  KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm8250.git
+  KERNEL_BRANCH: lineage-24.0
+  # Use SukiSU-Ultra's manual-hook branch for a hand-patched non-GKI 4.19 kernel.
+  KSU_BRANCH: builtin
+  KPM_PATCH_VERSION: 0.13.9
 
 jobs:
   build:
-    name: Build Kernel by ${{ github.actor }}
-    runs-on: ubuntu-latest
-
-    env:
-      CLANG_VERSION: clang-r536225
-      GCC_TAG: android-12.1.0_r27
-
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Set swap to 10G
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
-
-      - name: Setup build kernel environment
-        shell: bash
+      - name: Install build dependencies
         run: |
-          set -euo pipefail
-
-          echo "BUILD_TIME=$(TZ=Asia/Kolkata date '+%y%m%d')" >> "$GITHUB_ENV"
-          echo "BUILD_TIME_1=$(TZ=Asia/Kolkata date '+%Y-%m-%d')" >> "$GITHUB_ENV"
-
+          set -euxo pipefail
           sudo apt-get update
-
           sudo apt-get install -y \
-            git ccache automake flex lzop bison gperf build-essential \
-            zip curl wget zlib1g-dev g++-multilib bzip2 libbz2-dev \
-            liblz4-tool make squashfs-tools dpkg-dev libssl-dev \
-            python3 bc libc6-dev-i386 libncurses5-dev jq
+            git curl wget bc bison build-essential flex \
+            libssl-dev libelf-dev python3 cpio zip lz4 perl rsync
 
-          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-
-      # --------------------------------------------------
-      # TOOLCHAINS
-      # --------------------------------------------------
-
-      - name: Cache Clang toolchain
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/kernel_workspace/clang-aosp
-          key: ${{ env.CLANG_VERSION }}
-
-      - name: Download and extract Clang
-        if: steps.cache-clang.outputs.cache-hit != 'true'
-        shell: bash
+      - name: Set up Clang
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchains/clang"
+          curl -fL --retry 3 \
+            "https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz" \
+            -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/toolchains/clang"
+          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> "$GITHUB_PATH"
 
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p clang-aosp
-
-          wget -O "${CLANG_VERSION}.tar.gz" \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
-
-          tar -C clang-aosp -xzf "${CLANG_VERSION}.tar.gz"
-
-      - name: Cache GCC toolchain
-        id: cache-gcc
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/kernel_workspace/gcc-64
-          key: gcc-aarch64-${{ env.GCC_TAG }}
-
-      - name: Download and extract GCC
-        if: steps.cache-gcc.outputs.cache-hit != 'true'
-        shell: bash
+      - name: Set up GCC cross-compilers
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchains"
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            "$GITHUB_WORKSPACE/toolchains/gcc64"
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            "$GITHUB_WORKSPACE/toolchains/gcc32"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> "$GITHUB_PATH"
 
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-          mkdir -p gcc-64
-
-          wget -O gcc-aarch64.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${GCC_TAG}.tar.gz"
-
-          tar -C gcc-64 -xzf gcc-aarch64.tar.gz
-
-      # --------------------------------------------------
-      # KERNEL SOURCE
-      # --------------------------------------------------
-
-      - name: Download LineageOS 24 kernel source
-        shell: bash
+      - name: Clone LineageOS 24 kernel
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
+          git -C kernel log -1 --oneline
 
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
-
-          git clone \
-            --recursive \
-            --depth=1 \
-            --branch lineage-24.0 \
-            https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
-            android-kernel
-
-          cd android-kernel
-
-          echo "Kernel source branch:"
-          git branch --show-current
-
-          echo "Kernel source commit:"
-          git rev-parse HEAD
-
-          test -f fs/namespace.c
-          test -f arch/arm64/configs/vendor/kona-perf_defconfig
-          test -f arch/arm64/configs/vendor/debugfs.config
-
-      # --------------------------------------------------
-      # PATH_UMOUNT PATCH
-      # --------------------------------------------------
-
-      - name: Apply path_umount compatibility patch
-        shell: bash
+      - name: Integrate SukiSU-Ultra builtin (includes SUSFS support)
         run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE"
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path(
-              "kernel_workspace/android-kernel/fs/namespace.c"
-          )
-          patch = Path("patches/path_umount.c")
-
-          if not source.is_file():
-              raise SystemExit(f"Kernel source not found: {source}")
-
-          if not patch.is_file():
-              raise SystemExit(f"Patch file not found: {patch}")
-
-          text = source.read_text()
-          code = patch.read_text().strip()
-
-          function_signature = "int path_umount(struct path *path, int flags)"
-          marker = "SYSCALL_DEFINE2(umount,"
-
-          if function_signature in text:
-              raise SystemExit(
-                  "path_umount() already exists; refusing duplicate insertion"
-              )
-
-          if text.count(marker) != 1:
-              raise SystemExit(
-                  "Could not uniquely locate the umount syscall definition"
-              )
-
-          if not code:
-              raise SystemExit("path_umount.c is empty")
-
-          if function_signature not in code:
-              raise SystemExit(
-                  "The patch does not contain the expected path_umount() function"
-              )
-
-          text = text.replace(marker, code + "\n\n" + marker, 1)
-          source.write_text(text)
-
-          updated = source.read_text()
-
-          if updated.count(function_signature) != 1:
-              raise SystemExit("path_umount() insertion verification failed")
-
-          print("path_umount.c inserted successfully.")
-          PY
-
-      # --------------------------------------------------
-      # RSUNTK KERNELSU
-      # --------------------------------------------------
-
-      - name: Set up rsuntk KernelSU
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          curl -LSs \
-            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-            -o /tmp/ksu-setup.sh
-
-          bash /tmp/ksu-setup.sh main
-
-          test -d KernelSU
-
-          KSU_VERSION=$(cd KernelSU && expr "$(/usr/bin/git rev-list --count HEAD)" + 10200)
-
-          echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
-
-          sed -i 's/ -dirty//g' scripts/setlocalversion
-
-      # --------------------------------------------------
-      # FIX QUALCOMM SCHGM-FLASH HEADER INCLUDES
-      # --------------------------------------------------
-
-      - name: Fix Qualcomm schgm-flash header includes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          SOURCE="drivers/power/supply/qcom/schgm-flash.c"
-          HEADER="drivers/power/supply/qcom/smb5-lib.h"
-
-          if [ ! -f "$SOURCE" ]; then
-            echo "ERROR: $SOURCE was not found."
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          curl -fLSs --retry 3 \
+            https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
+            -o /tmp/sukisu-setup.sh
+          bash /tmp/sukisu-setup.sh "$KSU_BRANCH"
+          # setup.sh can print a fallback message while returning success if
+          # checkout fails. Do not silently continue on the main/GKI-oriented branch.
+          ACTUAL_KSU_BRANCH="$(git -C KernelSU branch --show-current)"
+          if [ "$ACTUAL_KSU_BRANCH" != "$KSU_BRANCH" ]; then
+            echo "ERROR: expected SukiSU branch '$KSU_BRANCH', got '$ACTUAL_KSU_BRANCH'. Refusing a GKI/main-branch build." >&2
+            git -C KernelSU status --short --branch >&2 || true
             exit 1
           fi
+          git -C KernelSU log -1 --oneline
+          test -d KernelSU/kernel
+          test -e drivers/kernelsu
+          grep -q 'kernelsu' drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
-          if [ ! -f "$HEADER" ]; then
-            echo "ERROR: $HEADER was not found."
-            exit 1
-          fi
-
-          python3 - <<'PY'
+      - name: Backport seccomp syscall-count definition for Linux 4.19 when needed
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
           from pathlib import Path
+          import re
 
-          source = Path("drivers/power/supply/qcom/schgm-flash.c")
-          text = source.read_text()
+          root = Path("drivers/kernelsu")
+          if not root.exists():
+              raise SystemExit(f"SukiSU integration directory not found: {root}")
 
-          required = '#include "smb5-lib.h"'
-          flash_header = '#include "schgm-flash.h"'
-
-          if required in text:
-              print("smb5-lib.h is already included.")
-          else:
-              if text.count(flash_header) != 1:
-                  raise SystemExit(
-                      "ERROR: Could not uniquely locate the schgm-flash.h include."
-                  )
-
-              text = text.replace(
-                  flash_header,
-                  required + "\n" + flash_header,
-                  1
-              )
-
-              source.write_text(text)
-              print("Added smb5-lib.h before schgm-flash.h.")
-
-          print("\nVerified include order:")
-          for line in source.read_text().splitlines():
-              if (
-                  '#include "smb5-lib.h"' in line
-                  or '#include "schgm-flash.h"' in line
+          # Do not assume a particular SukiSU directory layout. Patch only
+          # compiled-tree source files that actually reference this macro.
+          candidates = [p for p in root.rglob("*.c") if p.is_file()]
+          targets = []
+          for path in candidates:
+              source = path.read_text(errors="replace")
+              if re.search(r"\bSECCOMP_ARCH_NATIVE_NR\b", source) and not re.search(
+                  r"^\s*#\s*define\s+SECCOMP_ARCH_NATIVE_NR\b", source, re.M
               ):
-                  print(line)
+                  targets.append((path, source))
+
+          if not targets:
+              print("No unresolved SECCOMP_ARCH_NATIVE_NR use in drivers/kernelsu; no patch needed for this SukiSU revision.")
+          else:
+              for path, source in targets:
+                  include = "#include <linux/seccomp.h>"
+                  compatibility = (
+                      "#include <asm/unistd.h>\n\n"
+                      "#ifndef SECCOMP_ARCH_NATIVE_NR\n"
+                      "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls\n"
+                      "#endif /* SECCOMP_ARCH_NATIVE_NR */"
+                  )
+                  if "#include <asm/unistd.h>" not in source:
+                      if include not in source:
+                          raise SystemExit(
+                              f"{path} references SECCOMP_ARCH_NATIVE_NR but has no expected seccomp include; "
+                              "refusing to inject a potentially incorrect compatibility definition."
+                          )
+                      source = source.replace(include, include + "\n" + compatibility, 1)
+                      path.write_text(source)
+                      print(f"Added Linux 4.19 NR_syscalls fallback in {path}")
+                  elif "#define SECCOMP_ARCH_NATIVE_NR NR_syscalls" not in source:
+                      raise SystemExit(f"{path} already includes asm/unistd.h but needs manual review for the macro definition.")
+                  else:
+                      print(f"Compatibility fallback already present in {path}")
+          PYCODE
+
+      - name: Guard module namespace import for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          root = Path("drivers/kernelsu")
+          line = "MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);"
+          guarded = "#ifdef MODULE_IMPORT_NS\n" + line + "\n#endif /* MODULE_IMPORT_NS */"
+          candidates = [p for p in root.rglob("*.c") if p.is_file() and line in p.read_text(errors="ignore")]
+          if not candidates:
+              print("No MODULE_IMPORT_NS import found in this SukiSU revision; nothing to backport.")
+          else:
+              for path in candidates:
+                  source = path.read_text()
+                  if guarded in source:
+                      print(f"Already guarded: {path}")
+                  elif line in source:
+                      path.write_text(source.replace(line, guarded, 1))
+                      print(f"Guarded MODULE_IMPORT_NS for Linux 4.19 in {path}")
+          PYCODE
+
+      - name: Remove unsupported file_operations callbacks for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          preferred = Path("drivers/kernelsu/infra/file_wrapper.c")
+          root = Path("drivers/kernelsu")
+          if preferred.is_file():
+              path = preferred
+          else:
+              candidates = [p for p in root.rglob("*.c") if p.is_file() and
+                            ("ksu_wrapper_iopoll" in p.read_text(errors="ignore") or
+                             "ksu_wrapper_remap_file_range" in p.read_text(errors="ignore"))]
+              if not candidates:
+                  print("No unsupported iopoll/remap_file_range wrappers in this SukiSU revision; skipping.")
+                  raise SystemExit(0)
+              if len(candidates) != 1:
+                  raise SystemExit("Found wrapper definitions in multiple files; refusing an ambiguous edit: " + ", ".join(map(str, candidates)))
+              path = candidates[0]
+              print(f"Resolved file_wrapper source at {path}")
+          source = path.read_text()
+
+          def remove_definition(text, name):
+              """Remove one function definition without consuming surrounding #if lines."""
+              search_from = 0
+              while True:
+                  match = re.search(r"\b" + re.escape(name) + r"\s*\(", text[search_from:])
+                  if not match:
+                      return text, False
+                  name_start = search_from + match.start()
+                  open_paren = text.find("(", name_start)
+                  depth = 0
+                  close_paren = None
+                  for i in range(open_paren, len(text)):
+                      if text[i] == "(":
+                          depth += 1
+                      elif text[i] == ")":
+                          depth -= 1
+                          if depth == 0:
+                              close_paren = i
+                              break
+                  if close_paren is None:
+                      raise SystemExit(f"Unbalanced parameter list while locating {name} in {path}.")
+
+                  after = close_paren + 1
+                  while after < len(text) and text[after].isspace():
+                      after += 1
+                  if after >= len(text) or text[after] != "{":
+                      search_from = close_paren + 1
+                      continue
+
+                  # Find the declaration's start by walking backwards through the
+                  # adjacent declaration lines. Stop at blank lines and preprocessor
+                  # directives so a preceding #if/#ifdef is never removed.
+                  line_start = text.rfind("\n", 0, name_start) + 1
+                  declaration_start = line_start
+                  cursor = line_start
+                  while cursor > 0:
+                      prev_end = cursor - 1
+                      prev_start = text.rfind("\n", 0, prev_end) + 1
+                      prev_line = text[prev_start:prev_end].rstrip("\r")
+                      stripped = prev_line.strip()
+                      if not stripped or stripped.startswith("#") or any(ch in stripped for ch in "{};"):
+                          break
+                      declaration_start = prev_start
+                      cursor = prev_start
+
+                  # A return type is commonly on the line immediately above the
+                  # function name (e.g. 'static int\nfunction(...)'). Include it.
+                  # If no prior declaration line was found, the name line is the start.
+                  brace_depth = 0
+                  body_end = None
+                  for i in range(after, len(text)):
+                      if text[i] == "{":
+                          brace_depth += 1
+                      elif text[i] == "}":
+                          brace_depth -= 1
+                          if brace_depth == 0:
+                              body_end = i + 1
+                              break
+                  if body_end is None:
+                      raise SystemExit(f"Unbalanced function body while locating {name} in {path}.")
+                  if body_end < len(text) and text[body_end] == "\n":
+                      body_end += 1
+                  return text[:declaration_start] + text[body_end:], True
+
+          for function in ("ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range"):
+              # The upstream source can define the same wrapper in multiple
+              # mutually exclusive kernel-version branches. Remove EVERY
+              # definition, not just the first one, or the later body can be
+              # left behind with its return statement accidentally stripped.
+              removed_count = 0
+              while True:
+                  source, removed = remove_definition(source, function)
+                  if not removed:
+                      break
+                  removed_count += 1
+              if removed_count == 0:
+                  print(f"No definition of {function} found; checking for stale assignments.")
+              else:
+                  print(f"Removed {removed_count} definition(s) of {function}.")
+
+          # Remove only the file_operations assignments for fields absent from
+          # Linux 4.19. Do NOT delete every line mentioning these names: that
+          # can strip a return statement from a still-present non-void function.
+          kept_lines = []
+          assignment_pattern = re.compile(
+              r"\bops\.(?:iopoll|remap_file_range)\s*="
+          )
+          for line in source.splitlines(keepends=True):
+              if not line.lstrip().startswith("#") and assignment_pattern.search(line):
+                  continue
+              kept_lines.append(line)
+          source = "".join(kept_lines)
+
+          # Validate conditional structure, but never 'repair' it by deleting
+          # #else/#endif. If the source is malformed, fail with a useful error.
+          pp_stack = []
+          for number, line in enumerate(source.splitlines(), 1):
+              directive = re.match(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b", line)
+              if not directive:
+                  continue
+              kind = directive.group(1)
+              if kind in ("if", "ifdef", "ifndef"):
+                  pp_stack.append((kind, number, False))
+              elif kind in ("elif", "else"):
+                  if not pp_stack:
+                      raise SystemExit(f"Orphan #{kind} at {path}:{number}; refusing to delete directives automatically.")
+                  prior_kind, prior_line, had_else = pp_stack[-1]
+                  if had_else:
+                      raise SystemExit(f"#{kind} after #else for conditional opened at {path}:{prior_line}.")
+                  if kind == "else":
+                      pp_stack[-1] = (prior_kind, prior_line, True)
+              elif kind == "endif":
+                  if not pp_stack:
+                      raise SystemExit(f"Orphan #endif at {path}:{number}; refusing to delete directives automatically.")
+                  pp_stack.pop()
+          if pp_stack:
+              raise SystemExit(f"Unclosed preprocessor conditional(s) in {path}: {pp_stack}")
+
+          # Ignore comments when checking for stale identifiers; upstream has
+          # explanatory comments mentioning REMAP_FILE_DEDUP outside the code
+          # being removed.
+          code_only = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+          leftovers = [
+              f"{number}: {line.strip()}"
+              for number, line in enumerate(code_only.splitlines(), 1)
+              if not line.lstrip().startswith("#")
+              and re.search(r"\b(?:iopoll|remap_file_range|REMAP_FILE_DEDUP)\b", line)
+          ]
+          if leftovers:
+              raise SystemExit(f"Unsupported callback references remain in {path}: {leftovers}")
+
+          path.write_text(source)
+          print("Removed incompatible callback code; preserved and validated all preprocessor directives.")
+          PYCODE
+
+      - name: Fix KPM access_ok API for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          import re
+          from pathlib import Path
+
+          root = Path("drivers/kernelsu")
+          pattern = re.compile(
+              r'\baccess_ok\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*(sizeof\([^()]*\)|[A-Za-z_][A-Za-z0-9_.]*|\d+)\s*\)'
+          )
+          total = 0
+          for path in root.rglob("*.c"):
+              if not path.is_file():
+                  continue
+              source = path.read_text(errors="ignore")
+              updated, count = pattern.subn(r'access_ok(VERIFY_READ, \1, \2)', source)
+              if count:
+                  path.write_text(updated)
+                  total += count
+                  print(f"Updated {count} access_ok call(s) in {path}")
+          if total == 0:
+              print("No newer two-argument access_ok calls found in SukiSU source; no patch needed.")
+          else:
+              print(f"Updated {total} access_ok call(s) for the Linux 4.19 three-argument API.")
+          PYCODE
+
+      - name: Integrate SUSFS kernel-side patches for Linux 4.19
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+          SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
+          # GitLab occasionally returns a transient 5xx/overload response.
+          # Retry from a clean directory instead of failing the entire build immediately.
+          for attempt in 1 2 3 4 5; do
+            if git -c http.version=HTTP/1.1 clone --depth=1 --single-branch \
+              --branch kernel-4.19 "$SUSFS_REPO" "$SUSFS_DIR"; then
+              break
+            fi
+            rm -rf "$SUSFS_DIR"
+            if [ "$attempt" -eq 5 ]; then
+              echo "Unable to clone SUSFS after 5 attempts; GitLab may still be unavailable." >&2
+              exit 1
+            fi
+            delay=$((attempt * 15))
+            echo "SUSFS clone attempt $attempt failed; retrying in ${delay}s..." >&2
+            sleep "$delay"
+          done
+          SUSFS="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
+          test -s "$SUSFS/50_add_susfs_in_kernel-4.19.patch"
+          test -s "$SUSFS/fs/susfs.c"
+          test -s "$SUSFS/include/linux/susfs.h"
+          test -s "$SUSFS/include/linux/susfs_def.h"
+          install -m 0644 "$SUSFS/fs/susfs.c" fs/susfs.c
+          install -m 0644 "$SUSFS/include/linux/susfs.h" include/linux/susfs.h
+          install -m 0644 "$SUSFS/include/linux/susfs_def.h" include/linux/susfs_def.h
+
+          DIAG="$GITHUB_WORKSPACE/susfs-diagnostics"
+          mkdir -p "$DIAG/original" "$DIAG/after-patch"
+          cp "$SUSFS/50_add_susfs_in_kernel-4.19.patch" "$DIAG/"
+          for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
+            mkdir -p "$DIAG/original/$(dirname "$file")"
+            cp "$file" "$DIAG/original/$file"
+          done
+
+          # Apply the upstream patch's compatible hunks. This LineageOS branch has
+          # fs_context backports, so the rejected mount hunks are adapted below.
+          set +e
+          patch --batch --forward --reject-file="$DIAG/failed-hunks.rej" -p1 \
+            < "$SUSFS/50_add_susfs_in_kernel-4.19.patch" > "$DIAG/patch-output.log" 2>&1
+          PATCH_STATUS=$?
+          set -e
+          cat "$DIAG/patch-output.log"
+          if [ "$PATCH_STATUS" -ne 0 ]; then
+            grep -q '4 out of 16 hunks FAILED' "$DIAG/patch-output.log"
+            grep -q '1 out of 3 hunks FAILED' "$DIAG/patch-output.log"
+            grep -q '1 out of 1 hunk FAILED' "$DIAG/patch-output.log"
+            FAIL_COUNT=$(grep -c 'Hunk #[0-9].*FAILED' "$DIAG/patch-output.log" || true)
+            if [ "$FAIL_COUNT" -ne 6 ]; then
+              echo "Unexpected SUSFS patch failure count: $FAIL_COUNT (expected 6)" >&2
+              exit 1
+            fi
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"Expected one match in {path}, found {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # The include hunk's context differs because this branch includes fs_context.h.
+          replace_once(
+              "fs/namespace.c",
+              "#include <linux/fs_context.h>\n",
+              "#include <linux/fs_context.h>\n"
+              "#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n"
+              "#include <linux/susfs_def.h>\n"
+              "#endif\n",
+          )
+          replace_once(
+              "fs/namespace.c",
+              '#include "internal.h"\n',
+              '''#include "internal.h"
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          extern bool susfs_is_current_ksu_domain(void);
+          extern bool susfs_is_current_zygote_domain(void);
+
+          static DEFINE_IDA(susfs_mnt_id_ida);
+          static DEFINE_IDA(susfs_mnt_group_ida);
+
+          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+          #endif
+          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+          #endif
+          '''.replace("\n          ", "\n"),
+          )
+
+          replace_once(
+              "fs/namespace.c",
+              "\tmnt = alloc_vfsmnt(fc->source ?: \"none\");\n"
+              "\tif (!mnt)\n"
+              "\t\treturn ERR_PTR(-ENOMEM);",
+              '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \tif (unlikely(susfs_is_current_ksu_domain()))
+          \t\tmnt = alloc_vfsmnt(fc->source ?: "none", true, 0);
+          \telse
+          \t\tmnt = alloc_vfsmnt(fc->source ?: "none", false, 0);
+          #else
+          \tmnt = alloc_vfsmnt(fc->source ?: "none");
+          #endif
+          \tif (!mnt)
+          \t\treturn ERR_PTR(-ENOMEM);'''.replace("\n          ", "\n"),
+          )
+          replace_once(
+              "fs/namespace.c",
+              "\tmnt->mnt_parent\t\t= mnt;\n\n"
+              "\tlock_mount_hash();\n"
+              "\tlist_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);",
+              '''\tmnt->mnt_parent\t\t= mnt;
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// For zygote-created mounts, reorder the visible mount ID.
+          \tif (susfs_is_current_zygote_domain()) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif
+
+          \tlock_mount_hash();
+          \tlist_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);'''.replace("\n          ", "\n"),
+          )
+
+          replace_once(
+              "fs/namespace.c",
+              "\tstruct mount *mnt;\n\tint err;\n\n\tmnt = alloc_vfsmnt(old->mnt_devname);",
+              '''\tstruct mount *mnt;
+          \tint err;
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \tbool is_current_ksu_domain = susfs_is_current_ksu_domain();
+          \tbool is_current_zygote_domain = susfs_is_current_zygote_domain();
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t/* Distinguish a single clone from a mount-namespace copy. */
+          \tif (unlikely(is_current_ksu_domain)) {
+          \t\tif (!(flag & CL_COPY_MNT_NS)) {
+          \t\t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\t\tgoto bypass_orig_flow;
+          \t\t}
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
+          \t\tif (mnt)
+          \t\t\tmnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tif (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tif ((flag & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {
+          \t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          \t\tgoto bypass_orig_flow;
+          \t}
+          \tmnt = alloc_vfsmnt(old->mnt_devname, false, 0);
+          bypass_orig_flow:
+          #else
+          \tmnt = alloc_vfsmnt(old->mnt_devname);
+          #endif'''.replace("\n          ", "\n"),
+          )
+
+          # The upstream vfs_kern_mount hunk can match clone_mnt's similar block by fuzz.
+          wrong = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// If caller process is zygote, then it is a normal mount, so we just reorder the mnt_id
+          \tif (susfs_is_current_zygote_domain()) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif'''.replace("\n          ", "\n")
+          correct = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          \t// If caller is zygote and this is not a namespace copy, reorder the mount ID.
+          \tif (likely(is_current_zygote_domain) && !(flag & CL_ZYGOTE_COPY_MNT_NS)) {
+          \t\tmnt->mnt.susfs_mnt_id_backup = mnt->mnt_id;
+          \t\tmnt->mnt_id = current->susfs_last_fake_mnt_id++;
+          \t}
+          #endif'''.replace("\n          ", "\n")
+          p = Path("fs/namespace.c")
+          text = p.read_text()
+          if text.count(wrong) != 1:
+              raise SystemExit(f"Expected one misapplied zygote hunk in clone_mnt(), found {text.count(wrong)}")
+          p.write_text(text.replace(wrong, correct, 1))
+
+          replace_once(
+              "fs/proc/task_mmu.c",
+              "#include <linux/ctype.h>\n",
+              "#include <linux/ctype.h>\n"
+              "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+              "#include <linux/susfs_def.h>\n"
+              "#endif\n",
+          )
+          replace_once(
+              "include/linux/mount.h",
+              "\tANDROID_KABI_RESERVE(4);\n",
+              '''#ifdef CONFIG_KSU_SUSFS
+          \tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);
+          #else
+          \tANDROID_KABI_RESERVE(4);
+          #endif
+          #if defined(CONFIG_KSU_SUSFS) && !defined(ANDROID_KABI_RESERVE)
+          \tu64 susfs_mnt_id_backup;
+          #endif
+          '''.replace("\n          ", "\n"),
+          )
           PY
 
-      # --------------------------------------------------
-      # CONFIGURE KERNEL
-      # --------------------------------------------------
+          grep -q 'susfs_is_current_ksu_domain' fs/namespace.c
+          grep -q 'CL_COPY_MNT_NS' fs/namespace.c
+          grep -q 'ANDROID_KABI_USE(4, u64 susfs_mnt_id_backup)' include/linux/mount.h
+          grep -q 'susfs_def.h' fs/proc/task_mmu.c
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          test -s fs/susfs.c
+          test -s include/linux/susfs.h
+          test -s include/linux/susfs_def.h
+
+          # Build a real adapter over the SUSFS v1.5.5 APIs copied from the
+          # kernel-4.19 source branch. Do not fabricate missing functions as no-op
+          # macros: unsupported newer commands are removed from dispatch below.
+          cat > include/linux/susfs_ksu_compat.h <<'EOF'
+          #ifndef KSU_SUSFS_COMPAT_H
+          #define KSU_SUSFS_COMPAT_H
+          #include <linux/errno.h>
+          #include <linux/susfs.h>
+          #include <linux/susfs_def.h>
+
+          static inline int ksu_susfs_dispatch_add_sus_path(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+              return susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_add_sus_kstat(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+              return susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_update_sus_kstat(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+              return susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_set_uname(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+              return susfs_set_uname((struct st_susfs_uname __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_set_cmdline(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              return susfs_set_cmdline_or_bootconfig((char __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_add_open_redirect(void __user **arg)
+          {
+          #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+              return susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*arg);
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          static inline int ksu_susfs_dispatch_enable_log(void)
+          {
+          #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+              susfs_set_log(true);
+              return 0;
+          #else
+              return -EOPNOTSUPP;
+          #endif
+          }
+          #endif /* KSU_SUSFS_COMPAT_H */
+          EOF
+
+          # Adapt the actual dispatch call sites to the real SUSFS prototypes.
+          # Unsupported commands are removed, not mapped to fake success handlers.
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          preferred = Path("drivers/kernelsu/supercall/dispatch.c")
+          root = Path("drivers/kernelsu")
+          if preferred.is_file():
+              path = preferred
+          else:
+              candidates = [p for p in root.rglob("*.c") if p.is_file() and
+                            ("CMD_SUSFS_ADD_SUS_PATH" in p.read_text(errors="ignore") or
+                             "susfs_add_sus_path(" in p.read_text(errors="ignore"))]
+              if not candidates:
+                  print("No SUSFS dispatch implementation found in this SukiSU layout; skipping dispatch adaptation.")
+                  raise SystemExit(0)
+              if len(candidates) != 1:
+                  raise SystemExit("Ambiguous SUSFS dispatch files: " + ", ".join(map(str, candidates)))
+              path = candidates[0]
+              print(f"Resolved SUSFS dispatch source at {path}")
+          source = path.read_text()
+          if '#include <linux/susfs_ksu_compat.h>' not in source:
+              source = '#include <linux/susfs_ksu_compat.h>\n' + source
+
+          call_replacements = {
+              r'susfs_add_sus_path\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_sus_path(arg);',
+              r'susfs_add_sus_kstat\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_sus_kstat(arg);',
+              r'susfs_update_sus_kstat\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_update_sus_kstat(arg);',
+              r'susfs_set_uname\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_set_uname(arg);',
+              r'susfs_enable_log\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_enable_log();',
+              r'susfs_set_cmdline_or_bootconfig\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_set_cmdline(arg);',
+              r'susfs_add_open_redirect\(arg\);\s*return 0;': 'return ksu_susfs_dispatch_add_open_redirect(arg);',
+          }
+          for pattern, replacement in call_replacements.items():
+              source, count = re.subn(pattern, replacement, source)
+              if count == 0 and replacement not in source:
+                  raise SystemExit(f"Expected SUSFS dispatch call not found in {path}: {pattern}")
+
+          # These commands are not implemented by the actual SUSFS kernel-4.19
+          # source branch. Delete their case blocks so they cannot report success
+          # without doing work. The manager will receive the dispatch default error.
+          unsupported_case_patterns = [
+              r'\s*case CMD_SUSFS_ADD_SUS_PATH_LOOP:\s*susfs_add_sus_path_loop\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:\s*susfs_set_hide_sus_mnts_for_non_su_procs\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_ADD_SUS_MAP:\s*susfs_add_sus_map\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:\s*susfs_set_avc_log_spoofing\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_ENABLED_FEATURES:\s*susfs_get_enabled_features\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_VARIANT:\s*susfs_show_variant\(arg\);\s*return 0;\s*',
+              r'\s*case CMD_SUSFS_SHOW_VERSION:\s*susfs_show_version\(arg\);\s*return 0;\s*',
+          ]
+          for pattern in unsupported_case_patterns:
+              source, count = re.subn(pattern, '\n', source)
+              if count > 1:
+                  raise SystemExit(f"Unexpected duplicate unsupported SUSFS command cases for {pattern}: {count}")
+
+          # The SD-card monitor is not part of SUSFS v1.5.5's exported API.
+          source, monitor_count = re.subn(r'^\s*susfs_start_sdcard_monitor_fn\(\);\s*\n', '', source, flags=re.M)
+          path.write_text(source)
+
+          # Do not let unsupported calls survive as silent macros or implicit declarations.
+          forbidden = (
+              'susfs_add_sus_path_loop', 'susfs_set_hide_sus_mnts_for_non_su_procs',
+              'susfs_add_sus_map', 'susfs_set_avc_log_spoofing',
+              'susfs_get_enabled_features', 'susfs_show_variant',
+              'susfs_show_version', 'susfs_start_sdcard_monitor_fn',
+          )
+          remaining = [name for name in forbidden if name in source]
+          if remaining:
+              raise SystemExit(f"Unsupported SUSFS calls remain in {path}: {remaining}")
+          print("SUSFS dispatch now calls real kernel-4.19 SUSFS APIs; unsupported commands are not fake no-ops.")
+          print(f"Removed {monitor_count} unsupported SD-card-monitor call(s).")
+          PYCODE
+
+          # The imported SUSFS patch adds fs/susfs.o but does not define its
+          # Kconfig symbols. Kconfig silently drops scripts/config options that
+          # have no declarations, which caused CONFIG_KSU_SUSFS to disappear.
+          if ! grep -q '^# KSU-SUSFS workflow options$' drivers/kernelsu/Kconfig; then
+            cat >> drivers/kernelsu/Kconfig <<'KSU_SUSFS_KCONFIG'
+
+          # KSU-SUSFS workflow options
+          config KSU_SUSFS
+              bool "KernelSU SUSFS support"
+              depends on KSU
+              default y
+
+          config KSU_SUSFS_SUS_PATH
+              bool "SUSFS suspicious path support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_MOUNT
+              bool "SUSFS suspicious mount support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_KSTAT
+              bool "SUSFS suspicious stat support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SPOOF_UNAME
+              bool "SUSFS uname spoofing"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_ENABLE_LOG
+              bool "SUSFS logging"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+              bool "Hide SUSFS symbols"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              bool "SUSFS cmdline/bootconfig spoofing"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_OPEN_REDIRECT
+              bool "SUSFS open redirect"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_SUS_MAP
+              bool "SUSFS map support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_TRY_UMOUNT
+              bool "SUSFS try-umount support"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+              bool "SUSFS auto-add KernelSU default mount"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+              bool "SUSFS auto-add suspicious bind mounts"
+              depends on KSU_SUSFS
+              default y
+
+          config KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+              bool "SUSFS auto try-umount bind mounts"
+              depends on KSU_SUSFS
+              default y
+          KSU_SUSFS_KCONFIG
+          fi
+
+          DISPATCH="drivers/kernelsu/supercall/dispatch.c"
+          if [ ! -s "$DISPATCH" ]; then
+            DISPATCH="$(grep -RIl --include='*.c' -E 'CMD_SUSFS_ADD_SUS_PATH|susfs_add_sus_path\(' drivers/kernelsu | head -n 1 || true)"
+          fi
+          if [ -n "$DISPATCH" ] && [ -s "$DISPATCH" ]; then
+            if ! grep -q 'linux/susfs_ksu_compat.h' "$DISPATCH"; then
+              sed -i '1i#include <linux/susfs_ksu_compat.h>' "$DISPATCH"
+            fi
+          else
+            echo "No SUSFS dispatch source found in this SukiSU layout; skipping dispatch include injection."
+          fi
+
+          # SELinux-hide needs kernel internals unavailable in Linux 4.19.
+          FEATURE_C="drivers/kernelsu/policy/feature.c"
+          if [ -f "$FEATURE_C" ] && ! grep -Rqs 'KSU_FEATURE_SELINUX_HIDE' drivers/kernelsu --include='*.h'; then
+            sed -i '/KSU_FEATURE_SELINUX_HIDE/d' "$FEATURE_C"
+          fi
+
+          for file in fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile; do
+            mkdir -p "$DIAG/after-patch/$(dirname "$file")"
+            cp "$file" "$DIAG/after-patch/$file"
+          done
+          git diff -- fs/namespace.c fs/proc/task_mmu.c include/linux/mount.h fs/Makefile \
+            > "$DIAG/partial-kernel-diff.patch" || true
+
+      - name: Upload SUSFS patch diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-patch-diagnostics-${{ github.run_number }}
+          path: ${{ github.workspace }}/susfs-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Adapt SukiSU v4.2.1 to Linux 4.19 and SUSFS v1.5.5 APIs
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          root = Path("drivers/kernelsu")
+          if not root.is_dir():
+              raise SystemExit("SukiSU source directory is missing")
+
+          # 1) Linux 4.19 struct clocksource has no vdso_clock_mode member.
+          # Disable only this newer VDSO-specific assignment when the actual
+          # kernel header does not provide the field; retain the rest of CPU spoof.
+          clocksource_h = Path("include/linux/clocksource.h").read_text(errors="replace")
+          if "vdso_clock_mode" not in clocksource_h:
+              candidates = [p for p in root.rglob("*.c") if "vdso_clock_mode" in p.read_text(errors="ignore")]
+              for path in candidates:
+                  source = path.read_text()
+                  source, count = re.subn(r"\(\*curr_cs_ptr\)->vdso_clock_mode\s*=\s*[^;]+;", "/* VDSO clock-mode spoofing unavailable on this Linux 4.19 clocksource API. */", source, flags=re.S)
+                  if count == 0 and "vdso_clock_mode" in source:
+                      raise SystemExit(f"Found vdso_clock_mode in {path}, but could not safely isolate its assignment")
+                  path.write_text(source)
+                  print(f"Disabled {count} unsupported VDSO clock-mode assignment(s) in {path}")
+
+          # 2) Remove the SELinux-hide feature-table entry only if this checkout
+          # has no actual enum declaration for it. Also guard runtime call sites;
+          # this older kernel integration does not provide those functions.
+          feature_c = root / "policy/feature.c"
+          # The compiler has confirmed this enum value is unavailable in this
+          # checkout. Remove only its designated feature-table row; do not
+          # invent an enum value or alias it to an unrelated feature.
+          if feature_c.is_file():
+              source = feature_c.read_text()
+              source, count = re.subn(
+                  r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\][^\n]*\n", "", source
+              )
+              feature_c.write_text(source)
+              print(f"Removed {count} unsupported SELinux-hide feature-table entry/entries")
+              if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", source):
+                  raise SystemExit("Unsupported KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
+
+          # Some SELinux policy helpers are compiled with optional policy code
+          # disabled on older trees. Mark the policy pointers as maybe-unused so
+          # -Werror does not fail a build when those branches compile out.
+          for path in root.rglob("rules.c"):
+              source = path.read_text(errors="ignore")
+              patched, count = re.subn(
+                  r"(?m)^([ \t]*)struct selinux_policy \*pol, \*old_pol;[ \t]*$",
+                  r"\1struct selinux_policy *pol __maybe_unused, *old_pol __maybe_unused;",
+                  source
+              )
+              if count:
+                  path.write_text(patched)
+                  print(f"Marked {count} conditionally unused SELinux policy pointer declaration(s) in {path}")
+
+          for path in root.rglob("*.c"):
+              source = path.read_text(errors="ignore")
+              original = source
+              for call in ("ksu_selinux_hide_handle_post_fs_data", "ksu_selinux_hide_handle_second_stage"):
+                  # These APIs are absent from this SukiSU/Linux 4.19 source combination.
+                  source = re.sub(r"^(\s*)" + re.escape(call) + r"\(\);\s*$",
+                                  r"\1/* SELinux-hide hook unavailable in this kernel integration. */", source, flags=re.M)
+              if source != original:
+                  path.write_text(source)
+                  print(f"Disabled unavailable SELinux-hide hook call(s) in {path}")
+
+          # 3) SUSFS v1.5.5 uses this userspace ABI magic, but its kernel headers
+          # do not define the constant consumed by SukiSU's supercall dispatcher.
+          compat = Path("include/linux/susfs_ksu_compat.h")
+          if compat.is_file():
+              source = compat.read_text()
+              if "#define SUSFS_MAGIC" not in source:
+                  source = source.replace("#define KSU_SUSFS_COMPAT_H\n",
+                                          "#define KSU_SUSFS_COMPAT_H\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xFAFAFAFAU\n#endif\n", 1)
+                  compat.write_text(source)
+                  print("Added the documented SUSFS userspace ABI magic to the compatibility header")
+
+          # 4) These per-process state APIs are not implemented by the kernel-4.19
+          # SUSFS v1.5.5 source. Keep the call sites available for a future matching
+          # SUSFS implementation, but do not compile calls to absent symbols.
+          missing_state_apis = (
+              "susfs_set_current_proc_no_su",
+              "susfs_set_current_proc_umounted",
+              "susfs_set_current_proc_umounted_for_zygote_next",
+          )
+          for path in root.rglob("*.c"):
+              source = path.read_text(errors="ignore")
+              original = source
+              for api in missing_state_apis:
+                  # Guard individual call statements. This is not a fake function or
+                  # success stub; the newer per-process state feature is disabled.
+                  source = re.sub(r"^(\s*)" + re.escape(api) + r"\(\);\s*$",
+                                  r"#ifdef CONFIG_KSU_SUSFS_TASK_STATE_API\n\1" + api + r"();\n#endif /* CONFIG_KSU_SUSFS_TASK_STATE_API */",
+                                  source, flags=re.M)
+              if source != original:
+                  path.write_text(source)
+                  print(f"Guarded unsupported SUSFS task-state calls in {path}")
+
+          # 5) The newer adb-root helper names are not exported by SUSFS v1.5.5.
+          # Replace them with local, real string comparisons (not SUSFS stubs).
+          adb_candidates = [p for p in root.rglob("adb_root.c") if "susfs_starts_with" in p.read_text(errors="ignore") or "susfs_ends_with" in p.read_text(errors="ignore")]
+          for path in adb_candidates:
+              source = path.read_text()
+              if "ksu_compat_path_starts_with" not in source:
+                  includes = list(re.finditer(r"^#include[^\n]*\n", source, flags=re.M))
+                  insert_at = includes[-1].end() if includes else 0
+                  helpers = (
+                      "\n#include <linux/string.h>\n"
+                      "static bool ksu_compat_path_starts_with(const char *s, const char *prefix)\n"
+                      "{ return s && prefix && !strncmp(s, prefix, strlen(prefix)); }\n"
+                      "static bool ksu_compat_path_ends_with(const char *s, const char *suffix)\n"
+                      "{ size_t sl, pl; if (!s || !suffix) return false; sl = strlen(s); pl = strlen(suffix); return sl >= pl && !strcmp(s + sl - pl, suffix); }\n"
+                  )
+                  source = source[:insert_at] + helpers + source[insert_at:]
+              source = source.replace("susfs_starts_with(", "ksu_compat_path_starts_with(")
+              source = source.replace("susfs_ends_with(", "ksu_compat_path_ends_with(")
+              path.write_text(source)
+              print(f"Replaced unavailable SUSFS string helpers in {path}")
+
+          # Ensure the unresolved identifiers from the reported build are either
+          # genuinely handled or reported as an explicit integration limitation.
+          feature_source = feature_c.read_text(errors="ignore") if feature_c.is_file() else ""
+          if re.search(r"(?m)^[ \t]*\[KSU_FEATURE_SELINUX_HIDE\]", feature_source):
+              raise SystemExit("KSU_FEATURE_SELINUX_HIDE table entry remains in feature.c")
+          print("Compatibility pass complete. Note: SUSFS v1.5.5 cannot provide the newer per-process task-state or SELinux-hide features without a matching implementation.")
+          PYCODE
+          echo "::warning::SUSFS v1.5.5 lacks SukiSU's newer per-process task-state APIs; those hooks are conditionally disabled rather than replaced with fake stubs."
+          echo "::warning::SELinux-hide hooks and VDSO clock-mode spoofing are unavailable in this Linux 4.19 source combination."
+
+      - name: Fix MSM driver strnstr API call
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          preferred = Path("drivers/gpu/drm/msm/msm_drv.c")
+          old = 'strnstr(dev_name(dev), "mdp")'
+          new = 'strnstr(dev_name(dev), "mdp", strlen(dev_name(dev)))'
+          if preferred.is_file():
+              candidates = [preferred]
+          else:
+              candidates = [p for p in Path("drivers/gpu/drm/msm").rglob("*.c")
+                            if p.is_file() and old in p.read_text(errors="ignore")] if Path("drivers/gpu/drm/msm").exists() else []
+          total = 0
+          for path in candidates:
+              source = path.read_text()
+              count = source.count(old)
+              if count:
+                  path.write_text(source.replace(old, new))
+                  total += count
+                  print(f"Updated {count} strnstr call(s) in {path}")
+          if total == 0:
+              print("No matching two-argument MSM strnstr call found; this source revision needs no patch.")
+          PYCODE
+
+      - name: Audit version-sensitive SukiSU APIs against Linux 4.19 source
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          root = Path(".")
+          ksu = root / "drivers/kernelsu"
+          if not ksu.exists():
+              raise SystemExit("drivers/kernelsu is missing; SukiSU integration did not complete")
+
+          # This is a targeted inventory, not a claim that static scanning can
+          # prove full API compatibility. The compiler remains authoritative.
+          symbols = [
+              "SECCOMP_ARCH_NATIVE_NR", "NR_syscalls", "MODULE_IMPORT_NS",
+              "access_ok", "strnstr", "iopoll", "remap_file_range",
+              "ksu_wrapper_iopoll", "ksu_wrapper_remap_file_range",
+              "SUSFS_MAGIC", "KSU_FEATURE_SELINUX_HIDE",
+              "susfs_start_sdcard_monitor_fn", "susfs_enable_log",
+              "susfs_set_cmdline_or_bootconfig",
+              "CMD_SUSFS_ADD_SUS_PATH_LOOP",
+              "susfs_add_sus_path_loop",
+              "CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS",
+          ]
+          source_exts = {".c", ".h", ".S", ".s", ".inc"}
+          ksu_files = [p for p in ksu.rglob("*") if p.is_file() and p.suffix in source_exts]
+          kernel_files = [p for p in root.rglob("*") if p.is_file() and p.suffix in source_exts
+                          and ".git" not in p.parts and "out" not in p.parts]
+
+          # Read source files once; repeatedly reopening the entire kernel tree
+          # for every symbol would make this audit unnecessarily slow.
+          def load_lines(files):
+              loaded = []
+              for file in files:
+                  try:
+                      loaded.append((file, file.read_text(errors="ignore").splitlines()))
+                  except OSError:
+                      pass
+              return loaded
+
+          ksu_sources = load_lines(ksu_files)
+          kernel_sources = load_lines(kernel_files)
+
+          report = [
+              "# SukiSU / Linux 4.19 API compatibility inventory", "",
+              "This is a heuristic source inventory. Presence of a token does not prove API compatibility; absence does not prove a build failure.",
+              "Review each occurrence and use the compiler log for authoritative diagnostics.", "",
+          ]
+          for symbol in symbols:
+              uses = []
+              for f, lines in ksu_sources:
+                  for number, line in enumerate(lines, 1):
+                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
+                          uses.append(f"{f}:{number}: {line.strip()}")
+              if not uses:
+                  continue
+              found_outside_ksu = []
+              for f, lines in kernel_sources:
+                  if f.is_relative_to(ksu):
+                      continue
+                  for number, line in enumerate(lines, 1):
+                      if re.search(r"\b" + re.escape(symbol) + r"\b", line):
+                          found_outside_ksu.append(f"{f}:{number}: {line.strip()}")
+              report += [f"## `{symbol}`", "", "SukiSU occurrences:"]
+              report += [f"- `{x}`" for x in uses[:30]]
+              if len(uses) > 30:
+                  report.append(f"- ... {len(uses) - 30} additional occurrence(s)")
+              report += ["", "Occurrences elsewhere in the kernel tree (may be declarations, uses, or comments):"]
+              report += [f"- `{x}`" for x in found_outside_ksu[:30]] if found_outside_ksu else ["- No matching token found outside SukiSU."]
+              if len(found_outside_ksu) > 30:
+                  report.append(f"- ... {len(found_outside_ksu) - 30} additional occurrence(s)")
+              report.append("")
+
+          import os
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "sukisu-linux419-api-audit.md"
+          out.write_text("\n".join(report) + "\n")
+          print(f"Wrote compatibility inventory: {out}")
+          PYCODE
+
+      - name: Upload SukiSU Linux 4.19 API audit
+        if: always() && hashFiles('sukisu-linux419-api-audit.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sukisu-linux419-api-audit-${{ github.run_number }}
+          path: ${{ github.workspace }}/sukisu-linux419-api-audit.md
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Configure kernel
-        shell: bash
         run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
-
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
           mkdir -p out
+          if [ -f "$GITHUB_WORKSPACE/device_config" ]; then
+            cp "$GITHUB_WORKSPACE/device_config" out/.config
+            echo 'Using repository-provided device_config'
+          else
+            DEFCONFIG=''
+            for candidate in \
+              vendor/sm8250-perf_defconfig \
+              vendor/instantnoodlep_defconfig \
+              vendor/sm8250_defconfig \
+              instantnoodlep_defconfig; do
+              if [ -f "arch/arm64/configs/$candidate" ]; then
+                DEFCONFIG="$candidate"
+                break
+              fi
+            done
+            if [ -z "$DEFCONFIG" ]; then
+              echo 'ERROR: No known OnePlus 8 Pro/SM8250 defconfig was found.' >&2
+              find arch/arm64/configs -type f -name '*defconfig' | sort | grep -Ei 'sm8250|instantnoodlep|kona' || true
+              exit 1
+            fi
+            echo "Using defconfig: $DEFCONFIG"
+            make O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-android- \
+              CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+              CLANG_TRIPLE=aarch64-linux-gnu- CC=clang \
+              "$DEFCONFIG"
+          fi
+          # Always normalize the config before setting options; this prevents the
+          # interactive Kconfig restart prompts shown in the supplied failed log.
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- CC=clang olddefconfig
 
-          make O=out ARCH=arm64 vendor/kona-perf_defconfig
-
-          ARCH=arm64 scripts/kconfig/merge_config.sh \
-            -m \
-            -O out \
-            out/.config \
-            arch/arm64/configs/vendor/debugfs.config
-
-          make O=out ARCH=arm64 olddefconfig
-
-          cp out/.config out/kernel-config.txt
-
-          echo "Kernel version:"
-          make O=out ARCH=arm64 kernelversion
-
-          echo "KernelSU and tracing configuration:"
-          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES' \
-            out/.config || true
-
-          echo "Configuration completed."
-
-      # --------------------------------------------------
-      # BUILD KERNEL
-      # --------------------------------------------------
-
-      - name: Build kernel with rsuntk KernelSU
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export BRAND_SHOW_FLAG=oneplus
-
-          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc-64/bin:$PATH"
-
-          export KBUILD_BUILD_HOST=Github-Action
-          export KBUILD_BUILD_USER="$(echo '${{ github.actor }}' | tr 'A-Z' 'a-z')"
-
-          BA_CMD="CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-"
-          EX_CMD="LD=ld.lld LLVM=1 LLVM_IAS=1"
-
-          make -j"$(nproc --all)" \
-            O=out \
-            ARCH=arm64 \
-            CC=clang \
-            $BA_CMD \
-            $EX_CMD
-
-      # --------------------------------------------------
-      # VERIFY OUTPUT
-      # --------------------------------------------------
-
-      - name: Verify kernel output
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          IMAGE="out/arch/arm64/boot/Image"
-
-          if [ ! -s "$IMAGE" ]; then
-            echo "ERROR: Kernel Image was not generated."
+          scripts/config --file out/.config -e KSU
+          scripts/config --file out/.config -e KALLSYMS
+          scripts/config --file out/.config -e KALLSYMS_ALL
+          scripts/config --file out/.config -e KPM
+          scripts/config --file out/.config -e KSU_SUSFS
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_MOUNT
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_KSTAT
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file out/.config -e KSU_SUSFS_ENABLE_LOG
+          scripts/config --file out/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file out/.config -e KSU_SUSFS_SUS_MAP
+          # This old Android 4.19 tree's BPF UMD helper is not generated correctly
+          # (bpf_preload_umd_blob.S fails its .incbin). Keep core BPF enabled, but
+          # disable only the optional userspace preload helper that triggers the failure.
+          scripts/config --file out/.config -d BPF_PRELOAD_UMD
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- CC=clang olddefconfig
+          grep -E 'CONFIG_KSU=|CONFIG_KPM=|CONFIG_KSU_SUSFS' out/.config || true
+          grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_KPM=y' out/.config
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          if grep -Eq '^CONFIG_BPF_PRELOAD_UMD=[ym]' out/.config; then
+            echo 'ERROR: optional BPF UMD preload helper is still enabled' >&2
             exit 1
           fi
+          # Confirm the kernel-side SUSFS source and Makefile integration exist.
+          test -s fs/susfs.c
+          grep -q 'susfs' fs/Makefile
 
-          if [ ! -s out/include/config/kernel.release ]; then
-            echo "ERROR: Kernel release file was not generated."
+      - name: Fix Qualcomm charger build for the selected charging stack
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+
+          MAKEFILE="drivers/power/supply/qcom/Makefile"
+          CONFIG="out/.config"
+          test -s "$MAKEFILE"
+          test -s "$CONFIG"
+          test -s drivers/power/supply/qcom/schgm-flash.c
+          test -s drivers/power/supply/qcom/smb5-lib.h
+
+          echo "========== Selected charging configuration =========="
+          grep -E '^(CONFIG_OPLUS_SM8250_CHARGER|CONFIG_QPNP_SMB5|CONFIG_MFD_SPMI_PMIC)=' "$CONFIG" || true
+          echo "========== Original Qualcomm charger object rules =========="
+          sed -n '1,45p' "$MAKEFILE"
+
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          makefile = Path("drivers/power/supply/qcom/Makefile")
+          config = Path("out/.config").read_text()
+          source = makefile.read_text()
+
+          oplus_enabled = bool(re.search(r"^CONFIG_OPLUS_SM8250_CHARGER=[ym]$", config, re.M))
+          qpnp_enabled = bool(re.search(r"^CONFIG_QPNP_SMB5=[ym]$", config, re.M))
+
+          # Kbuild treats the Makefile's #ifdef/#else-looking lines as comments.
+          # Only the non-commented CONFIG_QPNP_SMB5 object assignment is active.
+          active_pattern = re.compile(
+              r"(?m)^(?![ \t]*#)([ \t]*obj-\$\(CONFIG_QPNP_SMB5\)[ \t]*\+=.*)$"
+          )
+          active = list(active_pattern.finditer(source))
+          if len(active) != 1:
+              raise SystemExit(
+                  f"Expected exactly one active CONFIG_QPNP_SMB5 object rule; found {len(active)}. "
+                  "Refusing an ambiguous Makefile edit."
+              )
+
+          if oplus_enabled:
+              # OPLUS supplies its own primary charger implementation. The
+              # standalone schgm-flash driver expects the generic SMB5 core
+              # structures/APIs, which are omitted in this OPLUS arrangement.
+              # Exclude only this auxiliary flash/torch driver; retain the OPLUS
+              # charger and fail if its required SPMI foundation is unavailable.
+              if not re.search(r"^CONFIG_MFD_SPMI_PMIC=[ym]$", config, re.M):
+                  raise SystemExit(
+                      "OPLUS charger is enabled but CONFIG_MFD_SPMI_PMIC is not enabled; "
+                      "refusing to build with an incomplete charger stack."
+                  )
+              replacement = (
+                  "obj-$(CONFIG_QPNP_SMB5) += step-chg-jeita.o battery.o "
+                  "pmic-voter.o storm-watch.o"
+              )
+              mode = "OPLUS charger stack"
+          elif qpnp_enabled:
+              # Otherwise build the complete standard Qualcomm SMB5 stack,
+              # including the definitions and helpers required by schgm-flash.
+              replacement = (
+                  "obj-$(CONFIG_QPNP_SMB5) += step-chg-jeita.o battery.o "
+                  "qpnp-smb5.o smb5-lib.o pmic-voter.o storm-watch.o schgm-flash.o"
+              )
+              mode = "standard Qualcomm SMB5 charger stack"
+          else:
+              raise SystemExit(
+                  "Neither CONFIG_OPLUS_SM8250_CHARGER nor CONFIG_QPNP_SMB5 is enabled. "
+                  "Refusing to build without a verified primary charger implementation."
+              )
+
+          match = active[0]
+          makefile.write_text(source[:match.start(1)] + replacement + source[match.end(1):])
+
+          final = makefile.read_text()
+          active_final = list(active_pattern.finditer(final))
+          if len(active_final) != 1:
+              raise SystemExit("Active Qualcomm charger object rule count changed unexpectedly.")
+          active_line = active_final[0].group(1)
+
+          if oplus_enabled:
+              if "schgm-flash.o" in active_line:
+                  raise SystemExit("OPLUS mode still builds the incompatible schgm-flash.o.")
+              if "qpnp-smb5.o" in active_line or "smb5-lib.o" in active_line:
+                  raise SystemExit("OPLUS mode unexpectedly builds the generic SMB5 core.")
+              if not re.search(r"^CONFIG_OPLUS_SM8250_CHARGER=[ym]$", config, re.M):
+                  raise SystemExit("OPLUS primary charger configuration is not enabled.")
+          else:
+              for obj in ("qpnp-smb5.o", "smb5-lib.o", "schgm-flash.o"):
+                  if obj not in active_line:
+                      raise SystemExit(f"Standard SMB5 mode is missing required object {obj}.")
+
+          print(f"Selected charging stack: {mode}")
+          print(f"Verified active object rule: {active_line}")
+          PYCODE
+
+          echo "========== Final Qualcomm charger object rules =========="
+          sed -n '1,45p' "$MAKEFILE"
+          echo "Charging-stack configuration verified."
+
+      - name: Resolve duplicate OnePlus display and Synaptics symbols
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          grep -qx 'CONFIG_ARCH_KONA=y' out/.config || {
+            echo 'ERROR: expected CONFIG_ARCH_KONA=y for this SM8250 device build' >&2
+            exit 1
+          }
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          # This vendor SM8250 tree uses techpack/display for its Kona display
+          # stack. The generic drivers/gpu/drm/msm Makefile uses the same
+          # CONFIG_DRM_MSM symbol, so both implementations were being linked.
+          display_mk = Path("drivers/gpu/drm/msm/Makefile")
+          text = display_mk.read_text()
+          target = "obj-$(CONFIG_DRM_MSM) += msm.o"
+          guarded = "ifneq ($(CONFIG_ARCH_KONA),y)\n" + target + "\nendif"
+          if guarded not in text:
+              pattern = r"(?m)^obj-\$\(CONFIG_DRM_MSM\)\s*\+=\s*msm\.o\s*$"
+              text, count = re.subn(pattern, "# Use techpack/display's vendor MSM stack on Kona.\n" + guarded, text)
+              if count != 1:
+                  raise SystemExit(f"Expected one generic DRM_MSM build rule in {display_mk}, found {count}")
+              display_mk.write_text(text)
+              print("Disabled the duplicate generic DRM_MSM target on ARCH_KONA; retained techpack/display")
+          else:
+              print("Generic DRM_MSM target already guarded for ARCH_KONA")
+
+          # Both Synaptics TCM implementations need their own completion object.
+          # The Oplus on-cell driver's completion is only referenced in this C file,
+          # so give it internal linkage rather than colliding with the generic core.
+          touch = Path("drivers/input/touchscreen/oplus_touchscreen/Synaptics/Syna_tcm_oncell/synaptics_tcm_oncell.c")
+          source = touch.read_text()
+          static_declaration = "static DECLARE_COMPLETION(response_complete);"
+          if static_declaration not in source:
+              source, count = re.subn(r"(?m)^DECLARE_COMPLETION\(response_complete\);$", static_declaration, source)
+              if count != 1:
+                  raise SystemExit(f"Expected one response_complete declaration in {touch}, found {count}")
+              touch.write_text(source)
+              print("Scoped the Oplus Synaptics response completion to its own driver")
+          else:
+              print("Oplus Synaptics response completion already has internal linkage")
+          PYCODE
+
+      - name: Resolve final-link SUSFS and DRM dependencies
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          # SUSFS 1.5.5 names the implementation susfs_try_umount(uid); the
+          # namespace patch calls the newer susfs_try_umount_all(uid) name.
+          susfs = Path("fs/susfs.c")
+          source = susfs.read_text()
+          wrapper = "\nvoid susfs_try_umount_all(uid_t uid)\n{\n    susfs_try_umount(uid);\n}\n"
+          marker = "#endif // #ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\n/* spoof_uname */"
+          if "void susfs_try_umount_all(uid_t uid)" not in source:
+              if marker not in source:
+                  raise SystemExit("Cannot locate SUSFS try-umount section to adapt susfs_try_umount_all")
+              source = source.replace(marker, wrapper + marker, 1)
+              susfs.write_text(source)
+              print("Mapped namespace try-umount entry point to SUSFS 1.5.5 implementation")
+
+          # SukiSU builtin's kernel_umount.c provides the real path_umount helper
+          # internally, but SUSFS 1.5.5 expects it exported as ksu_try_umount.
+          umount = Path("drivers/kernelsu/feature/kernel_umount.c")
+          if not umount.is_file():
+              candidates = list(Path("drivers/kernelsu").rglob("kernel_umount.c"))
+              if len(candidates) != 1:
+                  raise SystemExit("Could not uniquely locate SukiSU kernel_umount.c")
+              umount = candidates[0]
+          source = umount.read_text()
+          helper = "\n/* SUSFS 1.5.5 calls this helper for its registered try-umount paths. */\nvoid ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)\n{\n    const struct cred *saved;\n    (void)check_mnt; /* SUSFS 1.5.5 passes false for these calls. */\n    (void)uid;       /* Target uid is policy context, not caller credentials. */\n    if (!ksu_cred || !mnt)\n        return;\n    saved = override_creds(ksu_cred);\n    try_umount(mnt, flags);\n    revert_creds(saved);\n}\n"
+          if "void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)" not in source:
+              marker = "\nstruct umount_tw {"
+              pos = source.find(marker)
+              start = source.find("static void try_umount(const char *mnt, int flags)")
+              if start < 0 or pos < 0 or pos < start:
+                  raise SystemExit(f"Cannot safely locate try_umount insertion point in {umount}")
+              source = source[:pos] + helper + source[pos:]
+              umount.write_text(source)
+              print(f"Exported SUSFS-compatible umount adapter using SukiSU's real path_umount implementation in {umount}")
+
+          # SUSFS 1.5.5 does not provide the newer susfs_extra_works work item.
+          # Remove only the scheduling dependency; do not fabricate an empty work.
+          lsm = Path("drivers/kernelsu/hook/lsm_hook.c")
+          if not lsm.is_file():
+              candidates = list(Path("drivers/kernelsu").rglob("lsm_hook.c"))
+              if len(candidates) != 1:
+                  raise SystemExit("Could not uniquely locate SukiSU lsm_hook.c")
+              lsm = candidates[0]
+          source = lsm.read_text()
+          source = re.sub(r"(?m)^\s*extern struct work_struct susfs_extra_works;\s*\n", "", source)
+          source, helper_count = re.subn(r"(?s)static inline void ksu_handle_extra_susfs_work\(void\)\s*\{.*?\n\}", "", source, count=1)
+          source, call_count = re.subn(r"(?m)^\s*ksu_handle_extra_susfs_work\(\);\s*\n", "", source)
+          lsm.write_text(source)
+          print(f"Removed unavailable SUSFS extra-work scheduling helper ({helper_count} helper, {call_count} calls); SUSFS 1.5.5 has no implementation for it")
+
+          # The generic DRM MSM composite object duplicates several techpack
+          # implementations on Kona. Keep it excluded, but provide the real
+          # blocking notifier chain required by the vendor display stack.
+          drm_mk = Path("drivers/gpu/drm/msm/Makefile")
+          drm_source = Path("drivers/gpu/drm/msm/msm_drm_notifier_compat.c")
+          notifier_code = "\n".join([
+              "#include <linux/export.h>",
+              "#include <linux/notifier.h>",
+              "",
+              "static BLOCKING_NOTIFIER_HEAD(msm_drm_notifier_list);",
+              "",
+              "int msm_drm_register_client(struct notifier_block *nb)",
+              "{",
+              "    return blocking_notifier_chain_register(&msm_drm_notifier_list, nb);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_register_client);",
+              "",
+              "int msm_drm_unregister_client(struct notifier_block *nb)",
+              "{",
+              "    return blocking_notifier_chain_unregister(&msm_drm_notifier_list, nb);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_unregister_client);",
+              "",
+              "int msm_drm_notifier_call_chain(unsigned long val, void *v)",
+              "{",
+              "    return blocking_notifier_call_chain(&msm_drm_notifier_list, val, v);",
+              "}",
+              "EXPORT_SYMBOL(msm_drm_notifier_call_chain);",
+              ""
+          ])
+          if not drm_source.exists():
+              drm_source.write_text(notifier_code)
+              print("Added a real blocking notifier-chain implementation for the Kona vendor display stack")
+          elif "msm_drm_notifier_call_chain" not in drm_source.read_text():
+              raise SystemExit(f"Existing {drm_source} is not the expected notifier implementation")
+
+          mk = drm_mk.read_text()
+          build_rule = "ifeq ($(CONFIG_ARCH_KONA),y)\nobj-y += msm_drm_notifier_compat.o\nendif"
+          if "obj-y += msm_drm_notifier_compat.o" not in mk:
+              mk += "\n\n# Vendor techpack/display notifier API on Kona (generic msm.o excluded).\n" + build_rule + "\n"
+              drm_mk.write_text(mk)
+              print("Added notifier compatibility object while keeping duplicate generic msm.o excluded")
+
+          # Fail early if any targeted references remain unadapted.
+          if "susfs_extra_works" in lsm.read_text():
+              raise SystemExit("susfs_extra_works reference remains in lsm_hook.c")
+          if "void susfs_try_umount_all(uid_t uid)" not in susfs.read_text():
+              raise SystemExit("susfs_try_umount_all adapter was not written")
+          if "void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid)" not in umount.read_text():
+              raise SystemExit("ksu_try_umount adapter was not written")
+          print("Final-link compatibility adapters installed")
+          PYCODE
+
+      - name: Build kernel (save full compiler log)
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          LOG="$GITHUB_WORKSPACE/kernel-build.log"
+          set +e
+          make -j"$(nproc --all)" O=out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            2>&1 | tee "$LOG"
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+          {
+            echo '## Kernel build diagnostics'
+            echo
+            echo "Build exit code: $BUILD_STATUS"
+            echo
+            echo '### First compiler/build errors (if any)'
+            echo '```text'
+            grep -n -E 'fatal error:|error:|undefined reference|No rule to make target|make\[[0-9]+\]: \*\*\*' "$LOG" | head -n 100 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "Kernel build failed with exit code $BUILD_STATUS; full log will be uploaded as an artifact." >&2
+            exit "$BUILD_STATUS"
+          fi
+          test -s out/arch/arm64/boot/Image
+
+      - name: Upload kernel build log
+        if: always() && hashFiles('kernel-build.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log-${{ github.run_number }}
+          path: ${{ github.workspace }}/kernel-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Apply KPM patch
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
+          curl -fL --retry 3 \
+            "https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/${KPM_PATCH_VERSION}/patch_linux" \
+            -o patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          if [ -s oImage ]; then
+            mv -f oImage Image
+          else
+            echo 'KPM patch did not produce oImage; refusing to publish an unpatched kernel.' >&2
             exit 1
           fi
+          rm -f patch_linux
 
-          KERNEL_VERSION="$(cat out/include/config/kernel.release)"
-
-          echo "CHECK_IMAGE=true" >> "$GITHUB_ENV"
-          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
-
-          echo "Kernel build succeeded."
-          echo "Kernel release: $KERNEL_VERSION"
-          file "$IMAGE"
-
-      # --------------------------------------------------
-      # ANYKERNEL3 PACKAGE
-      # --------------------------------------------------
-
-      - name: Make AnyKernel3 package
-        if: ${{ env.CHECK_IMAGE == 'true' }}
-        shell: bash
+      - name: Package AnyKernel3 flashable ZIP
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          rm -rf .git modules patch ramdisk
+          cp ../out/arch/arm64/boot/Image ./Image
 
-          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          # Configure the installer for OnePlus 8 Pro. Fail if expected fields are absent.
+          grep -q '^do.devicecheck=' anykernel.sh
+          grep -q '^device.name1=' anykernel.sh
+          grep -q '^block=' anykernel.sh
+          grep -q '^is_slot_device=' anykernel.sh
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=1/' anykernel.sh
+          sed -i 's/^device.name1=.*/device.name1=instantnoodlep/' anykernel.sh
+          sed -i 's|^block=.*|block=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
+          sed -i 's/^is_slot_device=.*/is_slot_device=1;/' anykernel.sh
 
-          git clone \
-            --depth=1 \
-            https://github.com/rohanbatrain/AnyKernel3-SM8250 \
-            AnyKernel3
+          ZIP_NAME="SukiSU-Ultra-SUSFS_OnePlus8Pro_LOS24_$(date -u +%Y%m%d).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '.git/*' 'README.md' '*placeholder*'
+          test -s "$GITHUB_WORKSPACE/$ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' \
-            AnyKernel3/anykernel.sh
-
-          sed -i \
-            's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' \
-            AnyKernel3/anykernel.sh
-
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' \
-            AnyKernel3/anykernel.sh
-
-          cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
-
-          rm -rf AnyKernel3/.git AnyKernel3/.github
-          rm -f AnyKernel3/README.md
-
-      # --------------------------------------------------
-      # UPLOAD IMAGE ARTIFACT
-      # --------------------------------------------------
-
-      - name: Upload kernel Image
-        if: ${{ env.CHECK_IMAGE == 'true' }}
+      - name: Upload AnyKernel3 ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: Image-Android17-LineageOS24
-          path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
           if-no-files-found: error
+          retention-days: 14
 
-      # --------------------------------------------------
-      # UPLOAD ANYKERNEL3 ARTIFACT
-      # --------------------------------------------------
-
-      - name: Upload AnyKernel3
-        if: ${{ env.CHECK_IMAGE == 'true' }}
-        uses: actions/upload-artifact@v4
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
-          path: kernel_workspace/AnyKernel3/*
-          if-no-files-found: error
+          tag_name: sukisu-susfs-los24-${{ github.run_number }}
+          name: SukiSU-Ultra + SUSFS LOS24 Build ${{ github.run_number }}
+          body: |
+            Automated OnePlus 8 Pro kernel build for the LineageOS 24.0 branch.
 
-      # --------------------------------------------------
-      # CREATE ZIP PACKAGES
-      # --------------------------------------------------
+            Includes SukiSU-Ultra builtin, its integrated SUSFS options, and KPM.
 
-      - name: Create ZIP packages
-        if: ${{ env.CHECK_IMAGE == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          WORKSPACE="$GITHUB_WORKSPACE/kernel_workspace"
-
-          cd "$WORKSPACE/android-kernel/out/arch/arm64/boot"
-          zip "$GITHUB_WORKSPACE/Image.zip" Image
-
-          cd "$WORKSPACE/AnyKernel3"
-
-          zip -r \
-            "$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip" \
-            ./*
-
-      # --------------------------------------------------
-      # UPLOAD ZIP ARTIFACTS
-      # --------------------------------------------------
-
-      - name: Upload ZIP packages
-        if: ${{ env.CHECK_IMAGE == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ZIP-Packages-Android17-LineageOS24
-          path: |
-            Image.zip
-            AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip
-          if-no-files-found: error
-
-      # --------------------------------------------------
-      # TELEGRAM UPLOAD
-      # --------------------------------------------------
-
-      - name: Send AnyKernel3 to Telegram
-        if: ${{ env.CHECK_IMAGE == 'true' }}
-        shell: bash
+            Install the AnyKernel3 ZIP from custom recovery only after confirming the device and ROM compatibility. Keep a known-good boot image available before flashing.
+          files: ${{ github.workspace }}/${{ env.ZIP_NAME }}
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${TELEGRAM_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "Telegram credentials are not configured; skipping Telegram upload."
-            exit 0
-          fi
-
-          AK3_ZIP="$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip"
-
-          test -s "$AK3_ZIP"
-          test -s "$GITHUB_WORKSPACE/Image.zip"
-
-          caption2="\
-          <blockquote><a href=\"https://github.com/rsuntk/KernelSU\"><b>Unofficial KernelSU (rsuntk)</b> - ${KSUVER}</a></blockquote>
-
-          ROM:<blockquote><b>LineageOS 24 / Android 17 target</b></blockquote>
-          Device:<blockquote>OnePlus 8 | OnePlus 8 Pro | OnePlus 8T | OnePlus 9R</blockquote>
-          Kernel Version:<blockquote>${KERNEL_VERSION}</blockquote>
-          Build Time:<blockquote>${BUILD_TIME_1}</blockquote>
-          Special Note:
-          <blockquote>Use the matching unofficial KernelSU manager if required.</blockquote>
-
-          <a href=\"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\">GitHub Actions Build</a>"
-
-          media=$(jq -n \
-            --arg media1 "attach://anykernel3" \
-            --arg media2 "attach://Image" \
-            --arg caption2 "$caption2" \
-            '[
-              {
-                type: "document",
-                media: $media1
-              },
-              {
-                type: "document",
-                media: $media2,
-                caption: $caption2,
-                parse_mode: "HTML"
-              }
-            ]')
-
-          curl --fail-with-body --silent --show-error \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMediaGroup" \
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \
-            -F "media=${media}" \
-            -F "anykernel3=@${AK3_ZIP}" \
-            -F "Image=@${GITHUB_WORKSPACE}/Image.zip"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
