@@ -44,6 +44,10 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
 
+      # --------------------------------------------------
+      # TOOLCHAINS
+      # --------------------------------------------------
+
       - name: Cache Clang toolchain
         id: cache-clang
         uses: actions/cache@v4
@@ -86,6 +90,10 @@ jobs:
 
           tar -C gcc-64 -xzf gcc-aarch64.tar.gz
 
+      # --------------------------------------------------
+      # KERNEL SOURCE
+      # --------------------------------------------------
+
       - name: Download LineageOS 24 kernel source
         shell: bash
         run: |
@@ -111,6 +119,10 @@ jobs:
           test -f fs/namespace.c
           test -f arch/arm64/configs/vendor/kona-perf_defconfig
           test -f arch/arm64/configs/vendor/debugfs.config
+
+      # --------------------------------------------------
+      # PATH_UMOUNT PATCH
+      # --------------------------------------------------
 
       - name: Apply path_umount compatibility patch
         shell: bash
@@ -168,6 +180,10 @@ jobs:
           print("path_umount.c inserted successfully.")
           PY
 
+      # --------------------------------------------------
+      # RSUNTK KERNELSU
+      # --------------------------------------------------
+
       - name: Set up rsuntk KernelSU
         shell: bash
         run: |
@@ -188,6 +204,69 @@ jobs:
           echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
 
           sed -i 's/ -dirty//g' scripts/setlocalversion
+
+      # --------------------------------------------------
+      # FIX QUALCOMM SCHGM-FLASH HEADER INCLUDES
+      # --------------------------------------------------
+
+      - name: Fix Qualcomm schgm-flash header includes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+
+          SOURCE="drivers/power/supply/qcom/schgm-flash.c"
+          HEADER="drivers/power/supply/qcom/smb5-lib.h"
+
+          if [ ! -f "$SOURCE" ]; then
+            echo "ERROR: $SOURCE was not found."
+            exit 1
+          fi
+
+          if [ ! -f "$HEADER" ]; then
+            echo "ERROR: $HEADER was not found."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("drivers/power/supply/qcom/schgm-flash.c")
+          text = source.read_text()
+
+          required = '#include "smb5-lib.h"'
+          flash_header = '#include "schgm-flash.h"'
+
+          if required in text:
+              print("smb5-lib.h is already included.")
+          else:
+              if text.count(flash_header) != 1:
+                  raise SystemExit(
+                      "ERROR: Could not uniquely locate the schgm-flash.h include."
+                  )
+
+              text = text.replace(
+                  flash_header,
+                  required + "\n" + flash_header,
+                  1
+              )
+
+              source.write_text(text)
+              print("Added smb5-lib.h before schgm-flash.h.")
+
+          print("\nVerified include order:")
+          for line in source.read_text().splitlines():
+              if (
+                  '#include "smb5-lib.h"' in line
+                  or '#include "schgm-flash.h"' in line
+              ):
+                  print(line)
+          PY
+
+      # --------------------------------------------------
+      # CONFIGURE KERNEL
+      # --------------------------------------------------
 
       - name: Configure kernel
         shell: bash
@@ -218,9 +297,14 @@ jobs:
           make O=out ARCH=arm64 kernelversion
 
           echo "KernelSU and tracing configuration:"
-          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES' out/.config || true
+          grep -E 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES' \
+            out/.config || true
 
           echo "Configuration completed."
+
+      # --------------------------------------------------
+      # BUILD KERNEL
+      # --------------------------------------------------
 
       - name: Build kernel with rsuntk KernelSU
         shell: bash
@@ -228,45 +312,6 @@ jobs:
           set -euo pipefail
 
           cd "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
-
-          echo "=========================================="
-          echo " Qualcomm charger source diagnostics"
-          echo "=========================================="
-
-          echo "Current directory:"
-          pwd
-
-          echo ""
-          echo "Checking schgm-flash files:"
-          ls -la drivers/power/supply/qcom/schgm-flash.* || true
-
-          echo ""
-          echo "schgm-flash.c includes:"
-          sed -n '1,45p' drivers/power/supply/qcom/schgm-flash.c
-
-          echo ""
-          echo "schgm-flash.h:"
-          sed -n '1,100p' drivers/power/supply/qcom/schgm-flash.h
-
-          echo ""
-          echo "struct smb_charger definitions:"
-          grep -R -n 'struct smb_charger {' \
-            drivers/power/supply/qcom include/linux 2>/dev/null || true
-
-          echo ""
-          echo "struct smb_irq_data definitions:"
-          grep -R -n 'struct smb_irq_data {' \
-            drivers/power/supply/qcom include/linux 2>/dev/null || true
-
-          echo ""
-          echo "smblib_read and smblib_write declarations:"
-          grep -R -n -E 'smblib_(read|write)[[:space:]]*\(' \
-            drivers/power/supply/qcom include/linux 2>/dev/null || true
-
-          echo ""
-          echo "=========================================="
-          echo " Starting kernel build"
-          echo "=========================================="
 
           export ARCH=arm64
           export SUBARCH=arm64
@@ -286,6 +331,10 @@ jobs:
             CC=clang \
             $BA_CMD \
             $EX_CMD
+
+      # --------------------------------------------------
+      # VERIFY OUTPUT
+      # --------------------------------------------------
 
       - name: Verify kernel output
         shell: bash
@@ -315,6 +364,10 @@ jobs:
           echo "Kernel release: $KERNEL_VERSION"
           file "$IMAGE"
 
+      # --------------------------------------------------
+      # ANYKERNEL3 PACKAGE
+      # --------------------------------------------------
+
       - name: Make AnyKernel3 package
         if: ${{ env.CHECK_IMAGE == 'true' }}
         shell: bash
@@ -343,6 +396,10 @@ jobs:
           rm -rf AnyKernel3/.git AnyKernel3/.github
           rm -f AnyKernel3/README.md
 
+      # --------------------------------------------------
+      # UPLOAD IMAGE ARTIFACT
+      # --------------------------------------------------
+
       - name: Upload kernel Image
         if: ${{ env.CHECK_IMAGE == 'true' }}
         uses: actions/upload-artifact@v4
@@ -351,6 +408,10 @@ jobs:
           path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
           if-no-files-found: error
 
+      # --------------------------------------------------
+      # UPLOAD ANYKERNEL3 ARTIFACT
+      # --------------------------------------------------
+
       - name: Upload AnyKernel3
         if: ${{ env.CHECK_IMAGE == 'true' }}
         uses: actions/upload-artifact@v4
@@ -358,6 +419,10 @@ jobs:
           name: AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/AnyKernel3/*
           if-no-files-found: error
+
+      # --------------------------------------------------
+      # CREATE ZIP PACKAGES
+      # --------------------------------------------------
 
       - name: Create ZIP packages
         if: ${{ env.CHECK_IMAGE == 'true' }}
@@ -376,6 +441,10 @@ jobs:
             "$GITHUB_WORKSPACE/AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${KSUVER}-${BUILD_TIME}.zip" \
             ./*
 
+      # --------------------------------------------------
+      # UPLOAD ZIP ARTIFACTS
+      # --------------------------------------------------
+
       - name: Upload ZIP packages
         if: ${{ env.CHECK_IMAGE == 'true' }}
         uses: actions/upload-artifact@v4
@@ -385,6 +454,10 @@ jobs:
             Image.zip
             AK3-LineageOS_24-Android17-OPlus-SM8250-KSU_${{ env.KSUVER }}-${{ env.BUILD_TIME }}.zip
           if-no-files-found: error
+
+      # --------------------------------------------------
+      # TELEGRAM UPLOAD
+      # --------------------------------------------------
 
       - name: Send AnyKernel3 to Telegram
         if: ${{ env.CHECK_IMAGE == 'true' }}
